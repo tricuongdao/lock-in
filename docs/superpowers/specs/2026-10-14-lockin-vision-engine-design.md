@@ -334,6 +334,99 @@ Glasses detection runs **once at calibration** and stores a flag in the profile.
 is not a continuous signal, because stage 2b already covers eyes-closed robustness,
 and paying 4.92 MB of inference per tick would buy nothing.
 
+### 5.4 Head pose: why solvePnP, not a network
+
+Head pose comes from `solvePnP` over six landmarks rather than a pretrained head-pose
+network, despite several being available and permissively licensed.
+
+- **The decision does not need better accuracy.** `GlancingAway` and `Distracted`
+  turn on roughly 15–20° of deviation from the calibrated neutral. No head-pose
+  network reports better than ~3.5° MAE on real imagery, and solvePnP costs nothing
+  because the landmarks already exist.
+- **Past the threshold, precision stops mattering.** PnP does degenerate beyond
+  roughly ±25° yaw, as landmark error grows and the projection becomes
+  ill-conditioned — but by then the decision to leave `Focused` has already been
+  made. A more accurate network buys nothing at the point where we actually decide.
+- The cheap permissive alternative, OpenVINO `head-pose-estimation-adas-0001`
+  (Apache-2.0, 1.9 M params, real-imagery-trained, single-digit ms), was therefore
+  **not adopted**. It would add a sixth model and a fifth preprocessing regime to
+  improve a number we never consult.
+
+Two things to verify during implementation, because both produce **systematic** error
+rather than noise:
+
+- **Camera intrinsics.** Monocular PnP absorbs a wrong focal length as a fixed
+  pitch/yaw bias, which calibration would then bake in as a false neutral. The focal
+  estimate deserves a real check, not a guess derived from frame width.
+- **Profile-face landmarks.** Landmark quality past ±45° yaw determines whether PnP
+  degrades gracefully or produces nonsense. The dwell windows mask this, but it is
+  worth confirming deliberately rather than assuming.
+
+### 5.5 Why there is no pretrained "focused vs distracted" model
+
+Investigated thoroughly; the conclusion is that none exists that is **usable**, for
+three independent reasons. Recorded here so it is not re-litigated.
+
+**The student-engagement family is legally unusable.** DAiSEE is the obvious
+candidate — 9,068 clips, 112 subjects, 1080p **laptop webcam** footage from dorms and
+libraries, which is exactly our imagery domain. But its terms require agreeing to use
+the images "for research purposes only" and not to provide them to second parties, so
+**every DAiSEE-trained weight inherits that restriction**, whatever its model card
+claims.
+
+**Its accuracy was insufficient anyway.** The best published 4-class result is
+**63.9%** on the official held-out split. That test set is 0.22% "very low" — four
+clips — and the paper states that *"none of the methods are able to classify any
+samples to the first two classes correctly."* A third of predictions wrong and biased
+toward majority classes is not something to beep at a working user on.
+
+**The widely-cited high numbers are not the same task.** Claims of 99.86% on
+"subject-independent splits" are incompatible with ~30% measured label noise and a
+61-clip minority class, and read as split leakage. The 98.82% binary engaged/not-
+engaged figure is a different, far easier relabelling.
+
+Two further traps in this space: Ultralytics-derived drowsiness models carry an **MIT
+tag over AGPL-3.0 weights** — the same trap as the four original reference
+repositories — and one popular "student engagement" model's 94.2% headline is
+**training** accuracy over roughly 600 images of about 10 people.
+
+The cautionary data point: DAiSEE's own authors benchmarked a commercial affect SDK
+on real webcam video and found it reports **"attentive" while the subject's eyes are
+closed.** The best-funded attempt at this exact task fails on a signal we compute for
+free from landmarks.
+
+### 5.6 Why gaze is permanently excluded
+
+Gaze was dropped first because the chosen landmark model carries no iris points. Two
+further findings make that a permanent exclusion rather than a deferred feature.
+
+**Every usable pretrained gaze model is licence-poisoned.** Gaze360's licence forbids
+commercial use of *"models trained on dataset"* — not merely its images. All released
+L2CS-Net checkpoints and every MobileGaze model are Gaze360-trained, so their MIT and
+Apache-2.0 code badges do **not** grant the weights, and the Arm ONNX mirror carries
+the same defect. MPIIGaze and MPIIFaceGaze are CC BY-NC-SA 4.0 outright. The
+`py-feat` project hit this and relabelled its L2CS mirror from MIT to `other` for
+exactly this reason.
+
+This matters beyond commerce: a non-commercial restriction is incompatible with the
+OSI definition of open source, so shipping any of these would quietly convert LOCK-IN
+from *open source* into *source-available, non-commercial* — a direct conflict with D2.
+
+**Even with a licence, uncalibrated gaze fails on the case we care about.** The
+geometry: a webcam sits ~5 cm above a screen whose centre is ~60 cm away, so screen
+centre is about +5° pitch from the camera, while a phone held ~40 cm below the camera
+is about −53°. The differentiator is ~58°. Against L2CS's 10.41° cross-dataset error
+that is under 3σ. Worse, the error is **systematic rather than random**: MPIIGaze's
+vertical gaze range spans only **[−1.5°, +20°]**, so ~−30° phone gaze is
+out-of-distribution, and a bin classifier will confidently round toward the nearest
+familiar angle — reporting "screen" while the user reads their phone, every frame.
+Head pose does not rescue it, because held-phone and screen gazing produce similar
+head pitch; the separation lives in the eyes.
+
+Calibrated gaze at ~3.9° error would genuinely work, but only with per-user and
+per-camera-height calibration *and* a licence-clean model, and no such model currently
+exists. Gaze is therefore closed, not postponed.
+
 ---
 
 ## 6. Fusion — the Observation type
@@ -726,6 +819,7 @@ are too sparse for head pose and cannot detect eyes-closed at all.
 | **R12** | DirectML is in *sustained engineering* at Microsoft; new Windows ML investment moved to WinML. | The provider abstraction (§4.4) confines any future swap to WinML, or a retreat to CPU, to the `models/` module. Revisit at each ONNX Runtime release. |
 | **R13** | The models require **four incompatible preprocessing regimes** — RGB `/255` for Face Mesh, BGR `0–255` letterboxed for YOLOX, BGR `(x−127)/255` for the eye classifier, RGB with ImageNet mean/std for the glasses detector. Mixing them up yields plausible-looking but wrong output rather than a clean error. | Preprocessing lives beside each model wrapper in `models/`, never in a shared helper (§5.2, §5.3). A swapped colour order degrades detection visibly on the corpus, so the corpus catches it. |
 | **R14** | **OpenVINO's documentation contradicts its own code on eye class order.** The README says `[open, closed]`; the accuracy-checker converter and the gaze demo both say index 0 is closed. A silent inversion turns `Drowsy` into "alert while asleep" — the signal appears to work while being exactly backwards. | Trust the code, not the README (§5.3). Assert the class order with a unit test over a known closed-eye and a known open-eye fixture, so an upstream model swap cannot silently invert it. Normalisation is asserted the same way, since raw 0–255 input yields NaN rather than a visible failure. |
+| **R15** | PnP head pose carries **systematic** error when camera intrinsics are wrong — a bad focal length appears as a fixed pitch/yaw bias that calibration then bakes in as a false neutral. It also degenerates past roughly ±25° yaw. | Intrinsics get a real check rather than a guess from frame width. The 15–20° decision threshold is reached well before degeneracy, so accuracy past the decision point is not required (§5.4). |
 | **R6** | Thermal throttling on thin laptops changes latency mid-session and can starve the pipeline. | Adaptive tick rate already handles degradation; the harness records p95 latency and CPU over a full 30-minute run, not a short burst. |
 | **R7** | Calibration quality dominates real-world precision; a poor profile silently degrades everything downstream. | Calibration is a guided, validated capture that rejects bad sessions rather than storing them. |
 
