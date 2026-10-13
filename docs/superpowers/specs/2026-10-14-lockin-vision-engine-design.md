@@ -132,7 +132,7 @@ machine and its dwell timers, runs identically in tests and in production.
 | 0 · Motion gate | every tick, ~free | — | 64×48 grayscale frame difference. If the scene is static **and** a face was present on the previous tick, skip stages 1–3 entirely and re-emit the previous observation. |
 | 1 · Face presence | 5 Hz | YuNet (227 KB, MIT) | 0..N face boxes with 5 landmarks each → face count, "is anyone at the desk" |
 | 2 · Dense landmarks | 5 Hz, only when stage 1 found a face | Face Mesh, 478 points incl. iris (2.3–4.7 MB) | head pose via `solvePnP`, EAR, gaze vector |
-| 3 · Person + phone | 1–2 Hz, independent cadence | NanoDet-Plus (2.3 MB, Apache-2.0) | person boxes (class 0), cell-phone boxes (class 67) |
+| 3 · Person + phone | 1–2 Hz, independent cadence | YOLOX-Nano (~3.6 MB, Apache-2.0, ready-made ONNX) | person boxes (class 0), cell-phone boxes (class 67) |
 
 Design intent behind the cadences:
 
@@ -219,9 +219,10 @@ a Python runtime.
 |---|---|---|
 | Face count | Stage 1 box count | `OtherPresent`, `AwayFromDesk` |
 | Head pose (yaw, pitch, roll) | `solvePnP` over the six canonical Face Mesh indices `33, 263, 1, 61, 291, 199` | `Distracted`, `GlancingAway` |
-| Eye aspect ratio (EAR) | Six points per eye, standard EAR formula | `Drowsy` |
-| Gaze vector | Normalised iris-centroid offset within each eye (iris points 468–477) | `GlancingAway`, `Distracted` |
+| Eye aspect ratio (EAR) | Six points per eye, standard EAR formula | `Drowsy`, eyes-open |
 | Phone posture | Association of class-67 boxes with class-0 boxes, region-classified against the head box from stage 2 | `PhoneInUse` |
+
+There is deliberately **no gaze vector**. See §5.2.
 
 ### 5.1 Phone posture classification
 
@@ -237,6 +238,55 @@ classified:
 `Present` deliberately does not enter `PhoneInUse`. This distinction is the single
 most valuable idea taken from the prior art (§13) and it is what separates "a phone
 exists in the frame" from "the user is using their phone".
+
+### 5.2 Verified model I/O and preprocessing
+
+Verified against the PINTO and upstream sources. These are contracts the Rust
+implementation must satisfy exactly, and **every model has a different preprocessing
+regime** — sharing one preprocessing path between them is a bug waiting to happen.
+
+| | Face Mesh (stage 2) | YOLOX-Nano (stage 3) |
+|---|---|---|
+| Input name | `input` | `images` |
+| Input shape | `[N,3,192,192]` float32 | `[1,3,416,416]` float32 |
+| Colour | **RGB** — reverse of OpenCV's BGR | **BGR** |
+| Scale | `/255` → `[0,1]` | **0–255, no scaling** |
+| Normalisation | none | mean `[103.53, 116.28, 123.675]`, std `[57.375, 57.12, 58.395]` |
+| Geometry | resize **ignoring aspect ratio** | letterbox to a 32-multiple, pad value **114** |
+| Outputs | `score [N,1]`, `final_landmarks [N,468,3]` **int32** | `output [1,3549,85]` float32 |
+
+**Face Mesh requires a cropped face and cannot take a full frame.** It carries four
+extra int32 inputs — `crop_x1`, `crop_y1`, `crop_width`, `crop_height` — because the
+decode is fused into the graph; `_post` means post-processing is baked in. The graph
+returns **absolute pixel coordinates in the source frame**, so no manual un-cropping
+is needed; divide by frame dimensions to normalise.
+
+Two consequences:
+
+- **Stage 1 is load-bearing, not merely useful.** Its box is the crop rect, so a
+  missed face detection means total signal loss for stage 2. This is R2, now
+  confirmed structural rather than hypothetical, and it makes stage-1 recall a
+  first-class metric.
+- **The crop needs margin.** The upstream model card specifies a 25 % margin around
+  the face and PINTO's documentation warns the cropped area "must not be too
+  narrow". The crop rect is therefore the YuNet box expanded by a margin and clamped
+  to frame bounds — a tuning parameter the corpus must exercise.
+
+**There is no gaze vector, and this is a verified limitation, not an oversight.**
+The export emits 468 landmarks; iris points 468–477 belong to MediaPipe's
+`refine_landmarks` variant, which this graph does not contain. `GlancingAway` and
+`Distracted` therefore rest on **head pose**, with EAR covering eyes-open. Eye
+detection itself survives intact — landmarks 0–467 include full eye contours, so EAR
+and `Drowsy` are unaffected. The richer export (PINTO 410, 256×256) may carry 478
+points, but it ships with no README, no demo and no code, so its signature is
+unverified and this design does not depend on it.
+
+**YOLOX-Nano's output is fully raw** — there is no sigmoid in the graph.
+Post-processing in Rust is two elementwise operations (`+ grid`, `exp`) scaled by
+stride, then `sigmoid(obj) × sigmoid(cls)`, then class-agnostic NMS. NanoDet-Plus
+would additionally require a four-level centre-prior grid and four softmax-over-
+eight-bin DFL integrals per candidate point. That, plus shipping a ready-made ONNX
+with no PyTorch export step, is why YOLOX-Nano is the primary detector.
 
 ---
 
@@ -278,7 +328,7 @@ repositories classify per frame, which is exactly why they are noisy.
 enum FocusState {
     Starting,       // before any stable state exists: warm-up or calibration
     AwayFromDesk,   // no face for longer than the away threshold
-    Focused,        // face present, pose and gaze in bounds, eyes open, no phone
+    Focused,        // face present, head pose in bounds, eyes open, no phone
     GlancingAway,   // out of bounds, but not yet long enough to count
     Distracted,     // out of bounds, held past the distraction threshold
     PhoneInUse,     // phone associated with the person and classified as in use
@@ -541,8 +591,8 @@ this table.
 | Model | Code | Weights | Verdict |
 |---|---|---|---|
 | YuNet | MIT | **MIT** | ✅ Ship. 227 KB, official ONNX. |
-| NanoDet-Plus | Apache-2.0 | **Apache-2.0** | ✅ Ship. 2.3 MB, official ONNX export, COCO person=0 and cell phone=67. |
-| YOLOX-Nano | Apache-2.0 | Apache-2.0 | ✅ Fallback detector. 1.8 MB. |
+| **YOLOX-Nano** | Apache-2.0 | **Apache-2.0** | ✅ **Primary detector.** ~3.6 MB. Megvii ship a **ready-made ONNX**, so no Python export step is needed — decisive, since this machine has no Python. Simplest Rust post-processing of the two (§5.2). COCO person=0, cell phone=67. |
+| NanoDet-Plus | Apache-2.0 | Apache-2.0 | ✅ Alternative. ~4.7 MB FP32, but needs a PyTorch `.ckpt` run through `tools/export_onnx.py`, and its DFL decode is materially more Rust code. |
 | ONNX Runtime | MIT | — | ✅ Ship. |
 | MediaPipe Face Mesh | Apache-2.0 | **UNVERIFIED** | ⚠️ See R1. |
 | Ultralytics YOLO | AGPL-3.0 | **AGPL-3.0** | ❌ Excluded — would force all of LOCK-IN to AGPL. |
@@ -594,7 +644,7 @@ are too sparse for head pose and cannot detect eyes-closed at all.
 | ID | Risk | Mitigation |
 |---|---|---|
 | **R1** | MediaPipe Face Mesh weights licence unverified | Documented and attributed; tracked openly in `models/LICENSES/`. |
-| **R2** | Face Mesh is a cropper model, so stage 2 depends entirely on stage 1. A missed face detection cascades into total signal loss. | Measure stage-1 recall on the corpus specifically; consider a fallback path and treat stage-1 miss rate as a first-class metric. |
+| **R2** | **Confirmed structural, not hypothetical.** Face Mesh requires a cropped face and cannot take a full frame, so stage 2 depends entirely on stage 1 — a missed face detection is total signal loss. | Stage-1 recall is a first-class metric measured on the corpus. The crop rect carries a 25 % margin per the model card, and that margin is a corpus-tuned parameter (§5.2). |
 | **R3** | Phone association is the weakest signal. COCO "cell phone" is a small-object class with a high miss rate, and a phone on the desk is easily mistaken for phone use. | Region classification plus the ~2 s dwell; `Present` never counts as use; report phone-use recall separately from other states. |
 | **R4** | The labelled corpus is real work and may be skipped under time pressure, at which point all accuracy claims become unverifiable. | It is a declared deliverable of this slice and gates the acceptance criteria. |
 | **R5** | ~~NPU offload may not be viable.~~ **Resolved: it is not.** `ort`'s prebuilt binaries omit OpenVINO; Intel's prebuilt OpenVINO EP tops out at ORT 1.24.1 while `ort` 2.0 requires ORT 1.31.0; DirectML is GPU-only and cannot reach the NPU. | Requirement dropped. The Arc iGPU via bundled DirectML is the acceleration target; CPU remains the baseline (C3). |
@@ -603,6 +653,7 @@ are too sparse for head pose and cannot detect eyes-closed at all.
 | **R10** | **A GPU can be slower than the CPU for graphs this small**, and a particular driver can silently return wrong outputs. | Autotune measures and verifies rather than assumes, per model (§4.4). CPU stays the baseline (C3), and a provider that fails verification is dropped. |
 | **R11** | A driver reset or TDR event mid-session destroys the inference session. | Device-removed errors are caught and the affected session is rebuilt on CPU. The session survives with a few lost ticks. |
 | **R12** | DirectML is in *sustained engineering* at Microsoft; new Windows ML investment moved to WinML. | The provider abstraction (§4.4) confines any future swap to WinML, or a retreat to CPU, to the `models/` module. Revisit at each ONNX Runtime release. |
+| **R13** | The models require **three incompatible preprocessing regimes** — RGB `/255` for Face Mesh, BGR `0–255` letterboxed for YOLOX. Mixing them up yields plausible-looking but wrong output rather than a clean error. | Preprocessing lives beside each model wrapper in `models/`, never in a shared helper (§5.2). A swapped colour order degrades detection visibly on the corpus, so the corpus catches it. |
 | **R6** | Thermal throttling on thin laptops changes latency mid-session and can starve the pipeline. | Adaptive tick rate already handles degradation; the harness records p95 latency and CPU over a full 30-minute run, not a short burst. |
 | **R7** | Calibration quality dominates real-world precision; a poor profile silently degrades everything downstream. | Calibration is a guided, validated capture that rejects bad sessions rather than storing them. |
 
