@@ -1,0 +1,8 @@
+[package]
+name = "lockin-vision"
+description = "Headless vision engine: laptop-webcam frames in, focus-state events out."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+thiserror.workspace = true

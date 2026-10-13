@@ -1,0 +1,20 @@
+# LOCK-IN vision engine workspace. Library first; the CLI harnesses come later.
+[workspace]
+resolver = "3"
+members = ["crates/lockin-cli", "crates/lockin-vision"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+ort = "~2.0"
+nokhwa = { version = "0.10", features = ["input-msmf", "decoding"] }
+image = "0.25"
+windows = "0.62"
+clap = { version = "4", features = ["derive"] }
+smallvec = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+anyhow = "1"

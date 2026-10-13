@@ -1,0 +1,7 @@
+[package]
+name = "lockin-cli"
+description = "LOCK-IN command-line harnesses for the vision engine."
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
