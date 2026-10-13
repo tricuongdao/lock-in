@@ -41,7 +41,7 @@ through it and scoring accuracy and CPU cost against explicit gates.
 | D2 | **Open source, for strangers** | Real enforcement is required, so signing is on the critical path. |
 | D3 | **Rust + Tauri 2 + `ort`** | Leanest binaries and no runtime dependency; best fit for the lightweight requirement. Tauri is not used in this slice. |
 | D4 | **Cascaded tiered pipeline** | The only architecture that satisfies lightweight + fast + high precision together. A uniform single-pass design costs 3–5× the CPU. |
-| D5 | **Rich attention profile (Tier 3)** | Face presence, head pose, gaze, eyes-closed, phone-in-use, other-people-present. |
+| D5 | **Rich attention profile (Tier 3)** | Face presence, head pose, eyes-open/closed, phone-in-use, other-people-present. Gaze was dropped after verification showed the chosen landmark model carries no iris points — see §5.2. |
 | D6 | **High precision — silence over noise** | Applied to *both* measurement and interruption. A beep while the user legitimately blinks is what makes people uninstall a focus app. The accepted cost is that the dashboard under-reports. |
 | D7 | **Vision engine first** | Highest risk, fully testable in isolation. |
 
@@ -109,7 +109,7 @@ through it and scoring accuracy and CPU cost against explicit gates.
 lockin-vision  (Rust library — no camera side effects, no DB, no UI, no service)
     capture/   FrameSource trait → CameraSource (nokhwa) | ReplaySource (video file)
     models/    ONNX session wrappers, one per model
-    analyze/   NMS, solvePnP, EAR, gaze, phone↔person association
+    analyze/   NMS, solvePnP, EAR, eye state, phone↔person association
     fuse       → Observation
     state      → FocusState + FocusEvent
     schedule   adaptive rate control
@@ -131,7 +131,8 @@ machine and its dwell timers, runs identically in tests and in production.
 |---|---|---|---|
 | 0 · Motion gate | every tick, ~free | — | 64×48 grayscale frame difference. If the scene is static **and** a face was present on the previous tick, skip stages 1–3 entirely and re-emit the previous observation. |
 | 1 · Face presence | 5 Hz | YuNet (227 KB, MIT) | 0..N face boxes with 5 landmarks each → face count, "is anyone at the desk" |
-| 2 · Dense landmarks | 5 Hz, only when stage 1 found a face | Face Mesh, 478 points incl. iris (2.3–4.7 MB) | head pose via `solvePnP`, EAR, gaze vector |
+| 2 · Dense landmarks | 5 Hz, only when stage 1 found a face | Face Mesh (2.3 MB), 468 points | head pose via `solvePnP`, EAR, eye boxes |
+| 2b · Eye state | 5 Hz, only when stage 2 produced an eye box | open-closed-eye-0001 (45 KB, Apache-2.0) | eyes-open / eyes-closed, confirming EAR |
 | 3 · Person + phone | 1–2 Hz, independent cadence | YOLOX-Nano (~3.6 MB, Apache-2.0, ready-made ONNX) | person boxes (class 0), cell-phone boxes (class 67) |
 
 Design intent behind the cadences:
@@ -219,7 +220,8 @@ a Python runtime.
 |---|---|---|
 | Face count | Stage 1 box count | `OtherPresent`, `AwayFromDesk` |
 | Head pose (yaw, pitch, roll) | `solvePnP` over the six canonical Face Mesh indices `33, 263, 1, 61, 291, 199` | `Distracted`, `GlancingAway` |
-| Eye aspect ratio (EAR) | Six points per eye, standard EAR formula | `Drowsy`, eyes-open |
+| Eye aspect ratio (EAR) | Six points per eye, standard EAR formula | `Drowsy` candidate |
+| Eye state | 32×32 roll-corrected eye crop through open-closed-eye-0001 | `Drowsy` confirmation |
 | Phone posture | Association of class-67 boxes with class-0 boxes, region-classified against the head box from stage 2 | `PhoneInUse` |
 
 There is deliberately **no gaze vector**. See §5.2.
@@ -288,6 +290,49 @@ would additionally require a four-level centre-prior grid and four softmax-over-
 eight-bin DFL integrals per candidate point. That, plus shipping a ready-made ONNX
 with no PyTorch export step, is why YOLOX-Nano is the primary detector.
 
+### 5.3 Behaviour models
+
+Two small classifiers, adopted after verification showed they beat the geometric
+approach on their own signals. Both passed the test the rejected alternatives
+failed: **their training domain matches our imagery.**
+
+| | open-closed-eye-0001 (stage 2b) | Glasses-Detector (calibration) |
+|---|---|---|
+| Licence | Apache-2.0 (OpenVINO zoo, `models/public/`) | MIT |
+| Size | 45 KB | 4.92 MB (`anyglasses` / `eyeglasses` head) |
+| Input | `input.1` `[1,3,32,32]` f32, **BGR**, `(x−127)/255` | `images` `[1,3,256,256]` f32, **RGB**, ImageNet mean/std |
+| Output | `19` `[1,2,1,1]` softmax — **0 = closed, 1 = open** | `logits` `[1,1]`, positive = glasses present |
+| Cadence | every tick with an eye box | **once, at calibration** |
+| Trained on | MRL Eye Dataset — close-up eye crops | ten real face-image corpora |
+
+**Class order is inverted relative to the documentation.** OpenVINO's README states
+`[open, closed]`, but its own accuracy-checker converter defines
+`{0: 'closed', 1: 'open'}` and its gaze demo tests `out[0] < out[1]`. **The code is
+authoritative: index 0 is closed.** Trusting the README would invert `Drowsy` into
+"alert while asleep" — a silent, total failure of the signal. This is R14.
+
+**Normalisation is mandatory, not cosmetic.** Raw 0–255 input yields **NaN**, not
+merely degraded output.
+
+**The eye box** comes from stage-2 landmarks: a square 1.8× the inter-landmark eye
+distance, roll-corrected before cropping. That is the geometry OpenVINO's own gaze
+demo uses, and it is what makes the domain match hold.
+
+**Rejected alternatives, and why:**
+
+- **PPC / PUC** (phone use) — the positive class is *phone pointed at the camera*,
+  not phone held. Its `possession` samples carry filenames from PUC's
+  `point_somewhere` corpus, and `--test_ratio` defaults to `0.0`, so its F1 of 0.99
+  is in-distribution with no test set at all. Wrong semantics behind a good number.
+- **SC** (sitting) — trained on Google AVA Actions film footage as a 32×24
+  whole-body silhouette. A close-up webcam frame is head and shoulders, so the cue
+  it learned is absent. `AwayFromDesk` keeps the geometric approach: person presence
+  plus a desk region of interest.
+
+Glasses detection runs **once at calibration** and stores a flag in the profile. It
+is not a continuous signal, because stage 2b already covers eyes-closed robustness,
+and paying 4.92 MB of inference per tick would buy nothing.
+
 ---
 
 ## 6. Fusion — the Observation type
@@ -305,9 +350,9 @@ struct Observation {
 }
 
 struct FaceSignals {
-    head: Euler,        // yaw, pitch, roll in degrees
+    head: Euler,                // yaw, pitch, roll in degrees
     ear: f32,
-    gaze: (f32, f32),   // normalised iris offset
+    eye_closed: Option<bool>,   // stage 2b confirmation; None when no eye box
 }
 ```
 
@@ -351,6 +396,11 @@ enum FocusState {
 - **All thresholds are profile-relative**, never absolute. The ±10° constants in
   the prior art do not transfer between people, lighting, or eyewear and are
   actively harmful without calibration (§8).
+- **`Drowsy` requires two independent signals to agree.** EAR below the profile
+  threshold *and* the eye classifier reporting closed, both held for the entry
+  dwell. Requiring agreement strictly reduces false positives, which is the trade D6
+  asks for. It costs some `Drowsy` recall, and that cost is accepted deliberately
+  rather than discovered later.
 
 **Complete priority order on disagreement**, highest first. Every state appears, so
 no combination of signals is unhandled:
@@ -440,6 +490,9 @@ First run produces a `CalibrationProfile` from a guided ~60 s capture:
 - neutral head pose, giving the origin for yaw/pitch/roll
 - eyes-open EAR baseline, giving a per-user drowsiness threshold
 - per-user yaw and pitch bounds derived from the neutral pose
+- **whether the user wears glasses**, from a single calibration-time classifier
+  inference. Glasses are the documented failure mode for EAR, so this flag adapts
+  the EAR threshold rather than being displayed and ignored.
 
 Every derived threshold in §7 is expressed relative to this profile. The profile is
 a plain serialisable value; persisting it is slice B's concern, not this one. The
@@ -591,8 +644,12 @@ this table.
 | Model | Code | Weights | Verdict |
 |---|---|---|---|
 | YuNet | MIT | **MIT** | ✅ Ship. 227 KB, official ONNX. |
-| **YOLOX-Nano** | Apache-2.0 | **Apache-2.0** | ✅ **Primary detector.** ~3.6 MB. Megvii ship a **ready-made ONNX**, so no Python export step is needed — decisive, since this machine has no Python. Simplest Rust post-processing of the two (§5.2). COCO person=0, cell phone=67. |
+| **YOLOX-Nano** | Apache-2.0 | **Apache-2.0** | ✅ **Primary detector.** ~3.6 MB. Megvii ship a **ready-made ONNX**, so no PyTorch export step is needed. Simplest Rust post-processing of the two (§5.2). COCO person=0, cell phone=67. |
 | NanoDet-Plus | Apache-2.0 | Apache-2.0 | ✅ Alternative. ~4.7 MB FP32, but needs a PyTorch `.ckpt` run through `tools/export_onnx.py`, and its DFL decode is materially more Rust code. |
+| open-closed-eye-0001 | Apache-2.0 | **Apache-2.0** | ✅ Ship. 45 KB. Trained on the MRL Eye Dataset — close-up eye crops, matching our domain. **Index 0 = closed**, contrary to OpenVINO's own README. |
+| Glasses-Detector | MIT | **MIT** | ✅ Ship. 4.92 MB. Ten real face-image corpora, and it covers *transparent* glasses — the case that actually breaks EAR. Calibration-time only. |
+| PPC / PUC | MIT | MIT | ❌ Rejected for phone use. Positive class is phone *pointed at the camera*, not held, and `--test_ratio` defaults to `0.0`, so no test set exists. |
+| SC (Sitting) | MIT | MIT | ❌ Rejected. Trained on AVA film footage as a whole-body silhouette; a close-up webcam frame removes the cue it learned. |
 | ONNX Runtime | MIT | — | ✅ Ship. |
 | MediaPipe Face Mesh | Apache-2.0 | **UNVERIFIED** | ⚠️ See R1. |
 | Ultralytics YOLO | AGPL-3.0 | **AGPL-3.0** | ❌ Excluded — would force all of LOCK-IN to AGPL. |
@@ -653,7 +710,8 @@ are too sparse for head pose and cannot detect eyes-closed at all.
 | **R10** | **A GPU can be slower than the CPU for graphs this small**, and a particular driver can silently return wrong outputs. | Autotune measures and verifies rather than assumes, per model (§4.4). CPU stays the baseline (C3), and a provider that fails verification is dropped. |
 | **R11** | A driver reset or TDR event mid-session destroys the inference session. | Device-removed errors are caught and the affected session is rebuilt on CPU. The session survives with a few lost ticks. |
 | **R12** | DirectML is in *sustained engineering* at Microsoft; new Windows ML investment moved to WinML. | The provider abstraction (§4.4) confines any future swap to WinML, or a retreat to CPU, to the `models/` module. Revisit at each ONNX Runtime release. |
-| **R13** | The models require **three incompatible preprocessing regimes** — RGB `/255` for Face Mesh, BGR `0–255` letterboxed for YOLOX. Mixing them up yields plausible-looking but wrong output rather than a clean error. | Preprocessing lives beside each model wrapper in `models/`, never in a shared helper (§5.2). A swapped colour order degrades detection visibly on the corpus, so the corpus catches it. |
+| **R13** | The models require **four incompatible preprocessing regimes** — RGB `/255` for Face Mesh, BGR `0–255` letterboxed for YOLOX, BGR `(x−127)/255` for the eye classifier, RGB with ImageNet mean/std for the glasses detector. Mixing them up yields plausible-looking but wrong output rather than a clean error. | Preprocessing lives beside each model wrapper in `models/`, never in a shared helper (§5.2, §5.3). A swapped colour order degrades detection visibly on the corpus, so the corpus catches it. |
+| **R14** | **OpenVINO's documentation contradicts its own code on eye class order.** The README says `[open, closed]`; the accuracy-checker converter and the gaze demo both say index 0 is closed. A silent inversion turns `Drowsy` into "alert while asleep" — the signal appears to work while being exactly backwards. | Trust the code, not the README (§5.3). Assert the class order with a unit test over a known closed-eye and a known open-eye fixture, so an upstream model swap cannot silently invert it. Normalisation is asserted the same way, since raw 0–255 input yields NaN rather than a visible failure. |
 | **R6** | Thermal throttling on thin laptops changes latency mid-session and can starve the pipeline. | Adaptive tick rate already handles degradation; the harness records p95 latency and CPU over a full 30-minute run, not a short burst. |
 | **R7** | Calibration quality dominates real-world precision; a poor profile silently degrades everything downstream. | Calibration is a guided, validated capture that rejects bad sessions rather than storing them. |
 
