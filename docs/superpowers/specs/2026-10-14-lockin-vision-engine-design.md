@@ -84,9 +84,13 @@ through it and scoring accuracy and CPU cost against explicit gates.
 - **C2 — Permissive licensing only.** The project ships to strangers, so every
   model and dependency must be MIT or Apache-2.0. See §13 for the one documented
   exception.
-- **C3 — CPU is the baseline.** GPU acceleration via DirectML is an optimisation,
-  never a requirement; the engine must hit its budget on CPU alone. **The Intel NPU
-  is not reachable from this stack** (§12.1), so it is not a design target.
+- **C3 — CPU is the baseline; the GPU is vendor-agnostic.** Acceleration runs
+  through **DirectML**, which is vendor-neutral: it targets any Direct3D 12 adapter,
+  so NVIDIA, AMD and Intel GPUs are all first-class, discrete *and* integrated. Every
+  Windows 11 machine clears this bar, since Windows 11 already requires a WDDM 2.0+
+  driver. CPU remains the guaranteed fallback, and the engine must still hit its
+  budget on CPU alone. **The Intel NPU is not reachable from this stack** (§12.1) and
+  is not a design target.
 - **C6 — DirectML caps at ONNX opset 20.** Every model must be exported at opset 20
   or lower, or it silently loses iGPU acceleration.
 - **C4 — Reference hardware.** Intel Core Ultra 5 125H, Windows 11. Budgets are
@@ -152,6 +156,57 @@ so the camera thread never blocks the pipeline.
 `ReplaySource` reads a video file and presents frames on a virtual clock, with an
 option to run as fast as possible for batch evaluation or at real time for
 interactive inspection.
+
+### 4.4 Execution provider strategy
+
+Any GPU must work, integrated ones included — and equally, no machine may break
+because of its GPU. Two facts shape this.
+
+**DirectML is vendor-neutral.** It targets any Direct3D 12 adapter, so NVIDIA
+(Kepler and newer), AMD (GCN and newer) and Intel (Arc, Iris Xe, UHD) are all served
+by a single execution provider that ships inside `ort`'s prebuilt binaries. There is
+nothing extra to download and no per-vendor SDK. It is in ONNX Runtime's *sustained
+engineering* status and caps at **opset 20** (C6).
+
+**A GPU is not automatically faster here.** These models are 2–5 MB and run at
+1–5 Hz. For graphs this small, kernel-launch and transfer overhead can make an
+integrated GPU *slower* than plain CPU. Preferring the GPU by default would
+therefore be a pessimisation on some laptops, and on a battery-powered machine that
+runs for hours it also costs power.
+
+So the engine does not *choose* an execution provider — it **measures** one.
+
+| Step | Behaviour |
+|---|---|
+| Enumerate | Query available providers. DirectML and CPU are always candidates. |
+| Verify | Run each candidate over a sample of frames and compare its outputs against the CPU reference within tolerance. A provider that crashes or disagrees is discarded. |
+| Benchmark | Time each surviving candidate, **per model**, over the sample. |
+| Select | Pick the fastest verified configuration per model, not globally — it is entirely normal for the winner to be `face_detector: CPU, face_mesh: DirectML`. |
+| Persist | Store the selection in the runtime profile, alongside §8's calibration profile. |
+| Re-evaluate | On driver-version change, adapter change, or explicit user request. |
+
+Consequences that fall out of this design:
+
+- **Fallback is structural, not a special case.** Sessions list the chosen GPU
+  provider *and* CPU, so ONNX Runtime partitions the graph and runs unsupported
+  operators on CPU rather than failing.
+- **No GPU is not an error.** Remote Desktop sessions, VMs and GPU-less machines
+  have no D3D12 adapter. Session creation fails cleanly and the engine runs on CPU.
+  This is a supported configuration and the corpus tests it.
+- **A GPU can vanish mid-session.** Driver resets and TDR events surface as
+  device-removed errors. The engine catches them, rebuilds the affected session on
+  CPU, and continues — losing a few ticks, never the session.
+- **Discrete GPUs are not preferred by default.** On a hybrid laptop the autotune
+  may select the dGPU, but battery cost is weighed against latency gain, because
+  this app runs for hours. A few milliseconds is not worth the power.
+- **Stage 3 runs on its own thread and its own session.** This stops the slow
+  detector blocking the fast path, and it satisfies DirectML's rule that only one
+  thread may call `Run` per session (R9).
+
+CUDA and TensorRT are deliberately **not** supported in v1: they are NVIDIA-only,
+need multi-gigabyte runtimes, and would add nothing for graphs this small. The
+provider abstraction leaves room to add them later without touching the state
+machine.
 
 ---
 
@@ -433,6 +488,8 @@ number, but never removing a gate:
 | Average CPU, 30-minute replay | **< 3 % of one core** |
 | Peak RSS | **< 250 MB** |
 | Determinism | Identical report hash across repeated replays of the same input |
+| **GPU/CPU parity** | Identical `FocusState` sequence on CPU and on DirectML over the full corpus |
+| **GPU-less operation** | Full corpus passes with no D3D12 adapter present |
 
 The determinism gate matters more than it looks: without it, regressions in a
 probabilistic pipeline are undetectable.
@@ -461,7 +518,7 @@ listed so the boundary decisions are visible now, not because this slice uses th
 | Purpose | Crate | Version | Notes |
 |---|---|---|---|
 | ONNX inference | `ort` | 2.0.0-rc.14 | **No stable release exists.** Pin `~2.0`. Use `load-dynamic` to avoid DLL-resolution failures. |
-| GPU offload | `ort` feature `directml` | — | Bundled in every Windows prebuilt. Works with no extra runtime. |
+| GPU offload | `ort` feature `directml` | — | Bundled in every Windows prebuilt. **Vendor-neutral: NVIDIA, AMD and Intel, discrete and integrated.** No extra runtime. Caps at opset 20. |
 | Camera capture | `nokhwa` | 0.10.11 | `input-msmf` + `decoding`. Media Foundation, pure Rust, no C++ dependency. |
 | Session idle / lock | `windows` | 0.62.2 | Win32 called directly. No maintained wrapper crate exists. |
 | Storage *(slice B)* | `rusqlite` | 0.40.2 | `bundled` feature; clean MSVC build, no external DLL. |
@@ -542,7 +599,10 @@ are too sparse for head pose and cannot detect eyes-closed at all.
 | **R4** | The labelled corpus is real work and may be skipped under time pressure, at which point all accuracy claims become unverifiable. | It is a declared deliverable of this slice and gates the acceptance criteria. |
 | **R5** | ~~NPU offload may not be viable.~~ **Resolved: it is not.** `ort`'s prebuilt binaries omit OpenVINO; Intel's prebuilt OpenVINO EP tops out at ORT 1.24.1 while `ort` 2.0 requires ORT 1.31.0; DirectML is GPU-only and cannot reach the NPU. | Requirement dropped. The Arc iGPU via bundled DirectML is the acceleration target; CPU remains the baseline (C3). |
 | **R8** | **`ort` has no stable release.** 2.0.0-rc.14 has been a release candidate for roughly two years and the 2.x API is explicitly unstable — the weakest link for a shipping product. | Pin `~2.0` and keep every ONNX Runtime call inside `models/`, so `tract` (pure-Rust, CPU-only) is a drop-in fallback if `ort` breaks. Revisit when 2.0 goes stable. |
-| **R9** | DirectML permits **only one thread to call `Run` per session**, and disables memory-pattern and parallel execution. | Serialise inference per session; never share one session across threads. Model the constraint into the scheduler rather than discovering it under load. |
+| **R9** | DirectML permits **only one thread to call `Run` per session**, and disables memory-pattern and parallel execution. | Serialise inference per session; never share one session across threads. Stage 3 gets its own session and thread (§4.4) so the constraint is designed in rather than discovered under load. |
+| **R10** | **A GPU can be slower than the CPU for graphs this small**, and a particular driver can silently return wrong outputs. | Autotune measures and verifies rather than assumes, per model (§4.4). CPU stays the baseline (C3), and a provider that fails verification is dropped. |
+| **R11** | A driver reset or TDR event mid-session destroys the inference session. | Device-removed errors are caught and the affected session is rebuilt on CPU. The session survives with a few lost ticks. |
+| **R12** | DirectML is in *sustained engineering* at Microsoft; new Windows ML investment moved to WinML. | The provider abstraction (§4.4) confines any future swap to WinML, or a retreat to CPU, to the `models/` module. Revisit at each ONNX Runtime release. |
 | **R6** | Thermal throttling on thin laptops changes latency mid-session and can starve the pipeline. | Adaptive tick rate already handles degradation; the harness records p95 latency and CPU over a full 30-minute run, not a short burst. |
 | **R7** | Calibration quality dominates real-world precision; a poor profile silently degrades everything downstream. | Calibration is a guided, validated capture that rejects bad sessions rather than storing them. |
 
