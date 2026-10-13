@@ -25,6 +25,9 @@
 *.msi
 *.nupkg
 
+# --- SDD scratch workspace (ledger, briefs, review packages) ---
+/.superpowers/
+
 # --- IDE / OS ---
 .vs/
 .idea/

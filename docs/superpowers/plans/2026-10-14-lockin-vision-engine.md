@@ -28,8 +28,8 @@
 Five input classes the spec implies but that no single task's tests naturally exercise. Each gets a test in the owning task, named below.
 
 1. **Camera unavailable or held by another process.** A user with Zoom open still expects LOCK-IN to start, report clearly, and recover when the camera frees up. Owner: Task 5 (`test_camera_open_failure_is_not_fatal`).
-2. **Prolonged absence of any face.** Someone leaves for lunch; the engine must sleep within 60 s, must not accrue "distracted" time, and must resume instantly on return. Owner: Task 17 (`test_away_time_does_not_accrue_distraction`).
-3. **Extreme and profile head angles.** Past roughly ±25° yaw, PnP degenerates; a user turning to talk to someone must not produce NaN or a spurious `Focused`. Owner: Task 10 (`test_head_pose_is_bounded_and_never_nan`).
+2. **Prolonged absence of any face.** Someone leaves for lunch; the engine must sleep within 60 s, must not accrue "distracted" time, and must resume instantly on return. Owner: Task 16 (`test_away_time_does_not_accrue_distraction`).
+3. **Extreme and profile head angles.** Past roughly ±25° yaw, PnP degenerates; a user turning to talk to someone must not produce NaN or a spurious `Focused`. Owner: Task 8 (`test_head_pose_is_bounded_and_never_nan`).
 4. **Primary-face identity swapping between frames.** Two people in frame, boxes of similar size; if the primary face flip-flops, the state machine flaps and beeps. Owner: Task 14 (`test_primary_face_selection_is_stable_across_swaps`).
 5. **Model output at or below the confidence floor.** A dark room or heavy motion blur drives detector scores down; the engine must carry the last stable state forward rather than inventing a distraction. Owner: Task 16 (`test_low_confidence_ticks_carry_forward`).
 
