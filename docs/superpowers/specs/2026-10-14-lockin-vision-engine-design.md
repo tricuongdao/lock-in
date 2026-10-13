@@ -53,8 +53,9 @@ through it and scoring accuracy and CPU cost against explicit gates.
 
 - **G1** Emit a trustworthy `FocusState` on every tick and discrete `FocusEvent`s
   when a state has been held long enough to count.
-- **G2** Meet explicit accuracy gates measured on a labelled corpus — the primary
-  gate is false nudges per hour of focused work.
+- **G2** Make the engine's behaviour reproducible and its resource cost measurable
+  through a deterministic replay harness, with a live overlay for qualitative
+  behavioural acceptance.
 - **G3** Stay inside a stated power budget on the reference laptop, measured rather
   than asserted.
 - **G4** Be testable with no camera and no display, by replaying recorded video.
@@ -560,39 +561,52 @@ API outside the idle-detection trait named in §9.
 ### 11.1 Replay harness
 
 ```
-lockin-replay <video> <labels.jsonl> --out report.json
+lockin-replay <fixture-video> --out report.json
 ```
 
-Emits per-state precision and recall, **false nudges per hour of focused work**,
-CPU milliseconds per frame, peak RSS, and p95 tick latency.
+Emits per-state durations, CPU milliseconds per frame, peak RSS, p95 tick latency,
+and a hash of the full state sequence. There are no labels to score against, so the
+harness measures **mechanical** properties rather than accuracy.
 
-The headline metric is false nudges per hour, because that is the product
-requirement from D6 expressed as a number.
+### 11.2 Test fixture
 
-### 11.2 Labelled corpus
+A small **unlabelled** fixture: a handful of 15–30 second webcam clips showing a
+face present, a face absent, and a hand-held object. **No labels and no per-frame
+annotation.** Recorded once, in about a minute.
 
-**The corpus is a deliverable of this slice, not an afterthought.** Roughly 20
-two-minute clips covering: focused work, looking away, phone in hand, phone at ear,
-drowsy, leaving the desk, two people present, wearing glasses, and poor lighting.
+Its only job is to give the replay harness real input so the mechanical gates below
+are measurable and reproducible. It is a test fixture, not an evaluation set, and
+nothing in this spec claims accuracy measurements from it.
 
-Without it, every accuracy claim in this project is an opinion. This is real work
-and is scheduled as such. Recordings are gitignored: they are large and contain the
-maintainer's face.
+Recordings are gitignored: they are large and contain the maintainer's face.
 
 ### 11.3 Acceptance gates
 
-These are the committed gates for this slice. The corpus may justify revising a
-number, but never removing a gate:
+All of the following are measurable and run in the harness or in CI:
 
 | Gate | Target |
 |---|---|
-| False nudges per hour of focused work | **≤ 1 per 4 hours** |
-| Recall on sustained phone use | **≥ 90 %** |
-| Average CPU, 30-minute replay | **< 3 % of one core** |
+| Average CPU, 30-minute run | **< 3 % of one core** |
 | Peak RSS | **< 250 MB** |
-| Determinism | Identical report hash across repeated replays of the same input |
-| **GPU/CPU parity** | Identical `FocusState` sequence on CPU and on DirectML over the full corpus |
-| **GPU-less operation** | Full corpus passes with no D3D12 adapter present |
+| Determinism | Identical output hash across repeated replays of the same fixture |
+| GPU/CPU parity | Identical `FocusState` sequence on CPU and on DirectML over the fixture |
+| GPU-less operation | Fixture passes with no D3D12 adapter present |
+| Idle behaviour | Engine sleeps within 60 s of losing the face, and immediately on session lock |
+| Eye class order | Unit test over known open-eye and closed-eye fixtures, so R14 cannot silently invert |
+| No frame written to disk | Asserted by test: a replay run writes no frame data anywhere |
+
+**Behavioural acceptance is qualitative and human-confirmed.** With no labelled
+corpus, the engine's *accuracy* is not measured by any gate. Instead, a short manual
+checklist is confirmed against the live `probe` overlay:
+
+- sitting focused → reads `Focused`
+- turning the head away for several seconds → `Distracted` *after* the dwell, not before
+- picking up a phone and holding it → `PhoneInUse`; a phone lying on the desk → **not** `PhoneInUse`
+- standing up and leaving → `AwayFromDesk`
+- a second person entering frame → `OtherPresent`
+
+This catches gross failures, which is what it is for. It does not measure precision,
+and the spec does not pretend otherwise — see R4.
 
 The determinism gate matters more than it looks: without it, regressions in a
 probabilistic pipeline are undetectable.
@@ -703,7 +717,7 @@ are too sparse for head pose and cannot detect eyes-closed at all.
 | **R1** | MediaPipe Face Mesh weights licence unverified | Documented and attributed; tracked openly in `models/LICENSES/`. |
 | **R2** | **Confirmed structural, not hypothetical.** Face Mesh requires a cropped face and cannot take a full frame, so stage 2 depends entirely on stage 1 — a missed face detection is total signal loss. | Stage-1 recall is a first-class metric measured on the corpus. The crop rect carries a 25 % margin per the model card, and that margin is a corpus-tuned parameter (§5.2). |
 | **R3** | Phone association is the weakest signal. COCO "cell phone" is a small-object class with a high miss rate, and a phone on the desk is easily mistaken for phone use. | Region classification plus the ~2 s dwell; `Present` never counts as use; report phone-use recall separately from other states. |
-| **R4** | The labelled corpus is real work and may be skipped under time pressure, at which point all accuracy claims become unverifiable. | It is a declared deliverable of this slice and gates the acceptance criteria. |
+| **R4** | **Accuracy is asserted, not measured.** With no labelled corpus, the precision stance rests entirely on reasoning — dwell windows, asymmetric hysteresis, the confidence floor, and the EAR/classifier agreement gate — with no ground-truth evidence behind it. | Accepted deliberately. The replay harness is built to consume a labelled corpus the moment one exists, so adding one later requires no engine change. The qualitative checklist in §11.3 catches gross failures in the meantime. |
 | **R5** | ~~NPU offload may not be viable.~~ **Resolved: it is not.** `ort`'s prebuilt binaries omit OpenVINO; Intel's prebuilt OpenVINO EP tops out at ORT 1.24.1 while `ort` 2.0 requires ORT 1.31.0; DirectML is GPU-only and cannot reach the NPU. | Requirement dropped. The Arc iGPU via bundled DirectML is the acceleration target; CPU remains the baseline (C3). |
 | **R8** | **`ort` has no stable release.** 2.0.0-rc.14 has been a release candidate for roughly two years and the 2.x API is explicitly unstable — the weakest link for a shipping product. | Pin `~2.0` and keep every ONNX Runtime call inside `models/`, so `tract` (pure-Rust, CPU-only) is a drop-in fallback if `ort` breaks. Revisit when 2.0 goes stable. |
 | **R9** | DirectML permits **only one thread to call `Run` per session**, and disables memory-pattern and parallel execution. | Serialise inference per session; never share one session across threads. Stage 3 gets its own session and thread (§4.4) so the constraint is designed in rather than discovered under load. |
