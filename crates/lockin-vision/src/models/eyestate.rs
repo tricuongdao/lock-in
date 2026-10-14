@@ -625,6 +625,16 @@ mod tests {
         // both pinned. A crop of the frame's top-left corner instead — the same
         // *shape*, and the bug that looks right — reads blue 0 and 31 here.
         let tensor = preprocess(&frame, &eye_box);
+
+        // And it is the tensor for *this* box that reached the graph. Every
+        // assertion above is about shape and type, and a `classify` that
+        // preprocessed the whole frame — or any other window — satisfies all of
+        // them while deciding the verdict from the wrong pixels. Only the values
+        // say which pixels the answer is about.
+        assert_eq!(
+            input.data, tensor.data,
+            "the session got the crop of the caller's box, not some other window"
+        );
         assert_eq!(at(&tensor, 0, 0, 0), expected(16.0), "the box's left edge");
         assert_eq!(at(&tensor, 1, 0, 0), expected(8.0), "and its top edge");
         assert_eq!(
