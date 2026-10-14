@@ -53,9 +53,16 @@
 //! anywhere in its 214 nodes, and a real face measures `+18.1` while an empty
 //! wall measures `-9.0` and a too-narrow crop measuring `-2.9`. It is an
 //! unbounded **logit**, and it is returned as the graph produced it — applying a
-//! sigmoid here would be inventing arithmetic the model never did, and would
-//! make the demo's own `score > 0.95` gate mean something else. A caller that
-//! wants a probability can take the sigmoid of it.
+//! sigmoid here would be inventing arithmetic the model never did.
+//!
+//! So every gate on it has to be chosen in **logit space**, where the sign is
+//! the natural boundary: `> 0.0` is `p > 0.5`, the face / no-face line the
+//! measurements above straddle. Upstream's own `score > 0.95` is such a logit
+//! test — `p > 0.72`, not `p > 0.95`, which on a logit would be `2.94`. And this
+//! is the **opposite** convention from [`FaceBox`]'s `score`, the same field name
+//! under the same bare `f32` in this same crate, which really is a probability in
+//! `0.0..=1.0`: the two are never comparable, and neither is the other's
+//! threshold. A caller that wants a probability can take the sigmoid of it.
 
 use crate::analyze::nms::Rect;
 use crate::frame::Frame;
@@ -241,9 +248,12 @@ fn sample_rgb(frame: &Frame, x: f32, y: f32) -> (f32, f32, f32) {
     if width == 0 || height == 0 {
         return (0.0, 0.0, 0.0);
     }
-    // `NaN.clamp` is `NaN` and `NaN as usize` is `0`, so even a NaN coordinate
-    // lands on a real pixel instead of panicking. The crop's own fields are
-    // integers, so it cannot arise from `crop_rect`.
+    // A NaN coordinate still lands on a real pixel rather than panicking:
+    // `NaN.clamp` is `NaN`, and `NaN as usize` is `0` (the cast saturates), so
+    // every index below stays inside the buffer. The guarantee is only that —
+    // the NaN itself propagates through `frac_x`/`frac_y` and the sample comes
+    // back NaN. The crop's own fields are integers, so it cannot arise from
+    // `crop_rect`.
     let x = x.clamp(0.0, (width - 1) as f32);
     let y = y.clamp(0.0, (height - 1) as f32);
     let left = x.floor();
@@ -279,24 +289,45 @@ fn sample_rgb(frame: &Frame, x: f32, y: f32) -> (f32, f32, f32) {
     )
 }
 
-/// One face's dense landmarks, in the source frame's pixels.
+/// One face's dense landmarks: `x` and `y` in the source frame's pixels, `z` a
+/// relative depth. See [`Landmarks::points`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Landmarks {
     /// The 468 points, `[x, y, z]` each. `x` and `y` are **absolute pixels in
     /// the frame the face was cropped from** — the graph's fused post-process
-    /// has already put them there — and `z` is the model's own relative depth,
-    /// in the same arbitrary units the model was trained with, *not* scaled to
-    /// the crop.
+    /// has already put them there.
+    ///
+    /// `z` is **not** in frame pixels and has no single scale that makes it one:
+    /// the post-process scales `x` and `y` into the crop but concatenates `z`
+    /// raw, so it stays in the model's 192-unit input space, and `x` and `y`
+    /// leave that space at different rates — `crop_width / 192` and
+    /// `crop_height / 192` — whenever the crop is not square. The actionable
+    /// conversion is the one `x` uses, which is also MediaPipe's own convention
+    /// that "the magnitude of `z` uses roughly the same scale as `x`":
+    ///
+    /// ```text
+    /// z_frame_units = z * crop_width / 192
+    /// ```
+    ///
+    /// with the origin at the centre of the head and smaller meaning closer to
+    /// the camera. `crop_width` is [`crop_rect`]'s width for the box this face
+    /// came from.
     ///
     /// The ordering is MediaPipe's face-mesh topology, which is what makes
     /// per-point indices (eye corners, chin) meaningful downstream. There are no
     /// iris points: indices 468-477 of the full 478-point topology are absent.
     pub points: [[i32; 3]; LANDMARKS],
-    /// The graph's own confidence that it found a face to landmark.
+    /// The graph's own verdict on whether it found a face to landmark: a
+    /// **raw logit**, not a probability.
     ///
-    /// A **raw logit**, not a probability — see the module docs. Measured on the
-    /// shipping model: `+12` to `+18` for a real face, `-7` to `-12` for a wall
-    /// or a blank image, and `-2.9` for a crop too narrow to hold the face.
+    /// It must not be thresholded as a probability, and in particular not with
+    /// [`FaceBox`]'s `score`, the other `score` in this crate, which really is a
+    /// probability in `0.0..=1.0`. The sign is what separates a face from no
+    /// face — a real face measures `+12` to `+18`, a wall or a blank image `-7`
+    /// to `-12`, and a crop too narrow to hold the face `-2.9` — so `> 0.0` is
+    /// the natural default gate. Upstream's `> 0.95` is a logit test too, and a
+    /// much stricter one than it looks: `p > 0.72`, where `p > 0.95` would be
+    /// `2.94`.
     pub score: f32,
 }
 
@@ -360,6 +391,12 @@ fn decode(outputs: &[OutputTensor]) -> Result<Landmarks, ModelError> {
 }
 
 /// The graph's `score`, after checking its name, shape and length.
+///
+/// The length check earns its place for the same reason it does in
+/// [`read_landmarks`]: [`OutputTensor`]'s fields are public, so a `[1, 1]` shape
+/// can sit in front of a buffer of any length, and a read that takes the first
+/// element unconditionally would return a number the graph did not produce —
+/// silently, in the value every downstream confidence gate is built on.
 fn read_score(outputs: &[OutputTensor]) -> Result<f32, ModelError> {
     let output = output_named(outputs, SCORE_NAME)?;
     let expected = vec![1, 1];
@@ -374,12 +411,12 @@ fn read_score(outputs: &[OutputTensor]) -> Result<f32, ModelError> {
         .data
         .as_f32()
         .ok_or(ModelError::MissingOutput { name: SCORE_NAME })?;
-    match values.first() {
-        Some(value) => Ok(*value),
-        None => Err(ModelError::UnexpectedDataLength {
+    match values {
+        [value] => Ok(*value),
+        _ => Err(ModelError::UnexpectedDataLength {
             name: SCORE_NAME,
             shape: output.shape.clone(),
-            got: 0,
+            got: values.len(),
         }),
     }
 }
@@ -514,11 +551,24 @@ mod tests {
         // ae6ada9004f22be3ab6bab8cbfbc8b795f8595f69e5eea77b95cb2fc344c04eb)
         // with onnx, and confirmed by running it: `input` ['batch',3,192,192]
         // f32, four crop scalars ['batch',1] i32, and `final_landmarks`
-        // ['batch',468,3] i32. These three numbers are that signature; changing
-        // one silently breaks every landmark the engine produces.
+        // ['batch',468,3] i32. These constants are that signature; changing one
+        // silently breaks every landmark the engine produces.
         assert_eq!(CROP_MARGIN, 0.25, "the model card's margin, on each side");
         assert_eq!(INPUT_SIZE, 192, "the image input is fixed at 192x192");
         assert_eq!(LANDMARKS, 468, "468 points, and no iris points after them");
+
+        // The five input names against the graph's own bytes as literals, not
+        // against themselves. Every other test in this file writes its
+        // expectation in terms of these constants, so a typo in one — `crop_x`
+        // for `crop_x1` — satisfies all of them and would surface only at Task
+        // 19, against a real `ort` session, as a graph that will not bind. The
+        // output names already have this pin, as the literals in
+        // `landmarks_reject_outputs_the_graph_could_not_have_produced`.
+        assert_eq!(INPUT_NAME, "input");
+        assert_eq!(CROP_X1_NAME, "crop_x1");
+        assert_eq!(CROP_Y1_NAME, "crop_y1");
+        assert_eq!(CROP_WIDTH_NAME, "crop_width");
+        assert_eq!(CROP_HEIGHT_NAME, "crop_height");
     }
 
     #[test]
@@ -638,7 +688,10 @@ mod tests {
         let crop = crop_rect(&rect(200.0, 100.0, 100.0, 80.0), 640, 480);
         let tensor = preprocess(&solid, crop);
 
-        assert_eq!(tensor.name, INPUT_NAME, "the graph's image input name");
+        // A literal, not `INPUT_NAME`: `preprocess` builds the tensor's name
+        // from that constant, so asserting against it could not fail whatever
+        // the constant said. `input` is what the graph declares.
+        assert_eq!(tensor.name, "input", "the graph's own image input name");
         assert_eq!(
             tensor.shape,
             vec![1, 3, 192, 192],
@@ -899,6 +952,24 @@ mod tests {
         assert!(matches!(
             run(integer_score),
             Err(ModelError::MissingOutput { name: "score" })
+        ));
+
+        // The declared `[1, 1]` shape is not on its own enough to trust the
+        // buffer behind it: a `score` of two values must be rejected rather than
+        // quietly answered with the first one, and one of none must not be read
+        // as a zero.
+        let mut long_score = well_formed.clone();
+        long_score[0].data = TensorData::F32(vec![1.0, 2.0]);
+        assert!(matches!(
+            run(long_score),
+            Err(ModelError::UnexpectedDataLength { name: "score", .. })
+        ));
+
+        let mut empty_score = well_formed.clone();
+        empty_score[0].data = TensorData::F32(Vec::new());
+        assert!(matches!(
+            run(empty_score),
+            Err(ModelError::UnexpectedDataLength { name: "score", .. })
         ));
 
         let mut wide_score = well_formed;
