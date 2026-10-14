@@ -140,6 +140,35 @@ pub enum ModelError {
         /// The shape the session returned.
         got: Vec<i64>,
     },
+
+    /// The output's values do not fill the shape it declares.
+    ///
+    /// [`OutputTensor`]'s fields are public, so a session can hand back a shape
+    /// and a buffer that disagree — a truncated copy, a graph that emitted a
+    /// different batch, or a fake in a test. The decode indexes rows, so this
+    /// is checked before any of it: reading past the end of a slice panics, and
+    /// a function that returns `Result` must not.
+    #[error(
+        "model output '{name}' declares {} values but holds {got}",
+        .shape.iter().product::<i64>()
+    )]
+    UnexpectedDataLength {
+        /// The output whose data is short.
+        name: &'static str,
+        /// The shape it declared.
+        shape: Vec<i64>,
+        /// How many values it actually holds.
+        got: usize,
+    },
+
+    /// The session returned a different number of outputs than the model has.
+    #[error("session returned {got} output(s), expected {expected}")]
+    UnexpectedOutputCount {
+        /// How many outputs this model's graph declares.
+        expected: usize,
+        /// How many the session returned.
+        got: usize,
+    },
 }
 
 /// Runs one model graph.

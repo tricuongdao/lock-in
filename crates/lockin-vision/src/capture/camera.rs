@@ -15,11 +15,21 @@ use std::time::Instant;
 
 use nokhwa::Camera;
 use nokhwa::nokhwa_initialize;
-use nokhwa::pixel_format::RgbFormat;
+use nokhwa::pixel_format::RgbAFormat;
 use nokhwa::utils::{CameraIndex, RequestedFormat, RequestedFormatType};
 
 use super::{CaptureError, FrameSource};
 use crate::frame::Frame;
+
+/// Bytes per pixel a camera frame is decoded to.
+///
+/// Four, not three. [`RgbAFormat`] decodes to RGBA8, which is deliberate: a
+/// [`Frame`] holds BGRA8, so a 4-byte decode needs only a channel swap, whereas
+/// a 3-byte RGB decode would have to be widened a pixel at a time — and until
+/// it was, it would mismatch the `width * height * 4` a `Frame` demands and
+/// every `Frame::new` would fail, so the source would never yield a frame at
+/// all.
+const BYTES_PER_PIXEL: usize = 4;
 
 /// A live webcam, pulled for one frame at a time.
 ///
@@ -35,7 +45,7 @@ impl CameraSource {
     /// Opens the camera at `index`, the platform's device number — `0` is
     /// usually the built-in webcam.
     ///
-    /// The format is requested as RGB, which is what lets a frame reach the
+    /// The format is requested as RGBA, which is what lets a frame reach the
     /// pipeline without this crate carrying a YUYV, NV12 and JPEG decoder of
     /// its own: Media Foundation hands the device's native format to nokhwa,
     /// and nokhwa converts it.
@@ -53,7 +63,7 @@ impl CameraSource {
         nokhwa_initialize(|_granted| {});
 
         let format =
-            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+            RequestedFormat::new::<RgbAFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
         let camera = Camera::new(CameraIndex::Index(index), format)
             .map_err(|source| camera_error(index, source))?;
         Ok(CameraSource { index, camera })
@@ -78,23 +88,46 @@ impl FrameSource for CameraSource {
             .frame()
             .map_err(|source| camera_error(self.index, source))?;
         let image = buffer
-            .decode_image::<RgbFormat>()
+            .decode_image::<RgbAFormat>()
             .map_err(|source| camera_error(self.index, source))?;
         let (width, height) = image.dimensions();
-
-        let mut bgra = image.into_raw();
-        // `decode_image::<RgbFormat>` yields RGB8; a frame holds the same
-        // pixels as BGRA8, with an alpha the camera does not provide.
-        for pixel in bgra.as_chunks_mut::<4>().0 {
-            pixel.swap(0, 2);
-        }
 
         // Timestamped at read time, like the replay source: the frame's time is
         // when the pipeline got it, not a device-provided one, so the motion
         // gate's intervals are the tick rate however the driver behaves.
-        let frame = Frame::new(width, height, bgra, Instant::now())?;
+        let frame = frame_from_rgba(width, height, image.into_raw(), Instant::now())?;
         Ok(Some(frame))
     }
+}
+
+/// Wraps a decoded RGBA8 buffer as the [`Frame`] the pipeline reads.
+///
+/// Split out from [`FrameSource::next_frame`] so it can be tested without a
+/// device: the camera path is otherwise unverifiable on a machine with no
+/// webcam, and a byte-width mistake there is invisible until a real camera is
+/// plugged in. It is pure, so a test can hand it a buffer it built.
+///
+/// Returns `FrameError::BadBufferLength` for a buffer that is not exactly
+/// `width * height * 4` bytes — which is the failure a 3-byte RGB decode would
+/// have produced on every single frame.
+fn frame_from_rgba(
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+    captured_at: Instant,
+) -> Result<Frame, crate::frame::FrameError> {
+    let mut bgra = rgba;
+    // Four bytes per pixel, so every chunk is a whole pixel. `as_chunks_mut`
+    // rather than `chunks_exact_mut`: the latter leaves a partial-chunk path
+    // that cannot be reached for a length this function has already accepted,
+    // and the difference is the type of the chunk rather than a test.
+    for pixel in bgra.as_chunks_mut::<BYTES_PER_PIXEL>().0 {
+        // RGBA8 in, BGRA8 out: the red and blue channels trade places and the
+        // alpha the camera supplied is kept where it is. Swapping in place is
+        // why the intermediate is the caller's own vec rather than a copy.
+        pixel.swap(0, 2);
+    }
+    Frame::new(width, height, bgra, captured_at)
 }
 
 /// Wraps a backend failure with the device number it happened to.
@@ -113,6 +146,64 @@ fn camera_error(index: u32, source: nokhwa::NokhwaError) -> CaptureError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::frame::FrameError;
+
+    #[test]
+    fn rgba_from_the_camera_becomes_bgra_in_the_frame() {
+        // Two pixels, chosen so every channel is distinct — a swap that moved
+        // the wrong pair, or dropped one, cannot pass. Pixel 0 is
+        // RGBA (1, 2, 3, 4); pixel 1 is (250, 251, 252, 253).
+        let rgba = vec![1u8, 2, 3, 4, 250, 251, 252, 253];
+        let frame =
+            frame_from_rgba(2, 1, rgba, Instant::now()).expect("two pixels, four bytes each");
+
+        assert_eq!((frame.width, frame.height), (2, 1));
+        assert_eq!(
+            frame.bgra,
+            vec![
+                3, 2, 1, 4, // RGBA (1, 2, 3, 4) is BGRA (3, 2, 1, 4)
+                252, 251, 250, 253, // and RGBA (250, .., 252, 253) is (252, .., 250, 253)
+            ],
+            "red and blue trade places and alpha stays put, per pixel"
+        );
+
+        // The buffer is exactly `width * height * 4` — two pixels of four bytes
+        // — which is the whole point: a 3-byte-per-pixel decode would make
+        // `Frame::new` reject every frame, so the length is asserted as well as
+        // the contents.
+        assert_eq!(frame.bgra.len(), 8);
+    }
+
+    #[test]
+    fn a_byte_width_mismatch_is_an_error_not_a_frame() {
+        // The exact shape of the bug this function exists to prevent: six
+        // bytes for two pixels, which is 3 bytes per pixel — what `RgbFormat`
+        // hands back. It must be reported, not swapped into a scrambled frame.
+        let rgb_shaped = vec![0u8; 6];
+        assert!(matches!(
+            frame_from_rgba(2, 1, rgb_shaped, Instant::now()),
+            Err(FrameError::BadBufferLength {
+                expected: 8,
+                got: 6
+            })
+        ));
+
+        // A buffer with a trailing partial pixel is the other way this can go
+        // wrong, and the one that would make an in-place swap panic if it
+        // assumed whole pixels.
+        let ragged = vec![0u8; 11];
+        assert!(matches!(
+            frame_from_rgba(2, 1, ragged, Instant::now()),
+            Err(FrameError::BadBufferLength {
+                expected: 8,
+                got: 11
+            })
+        ));
+
+        // And a correct buffer is accepted, so the two cases above are not
+        // passing because everything fails.
+        assert!(frame_from_rgba(2, 1, vec![0u8; 8], Instant::now()).is_ok());
+    }
 
     #[test]
     fn camera_open_failure_is_not_fatal() {
