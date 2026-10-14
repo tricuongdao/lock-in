@@ -5,9 +5,11 @@
 //! interchangeable — which is what lets the whole pipeline be tested with no
 //! camera present.
 
+mod camera;
 mod replay;
 mod synthetic;
 
+pub use camera::CameraSource;
 pub use replay::ReplaySource;
 pub use synthetic::{SyntheticPattern, SyntheticSource};
 
@@ -32,6 +34,19 @@ pub enum CaptureError {
         path: PathBuf,
         #[source]
         source: image::ImageError,
+    },
+
+    /// A camera could not be opened, or a frame could not be read from one.
+    ///
+    /// A missing camera, a camera another application already holds, and a
+    /// device that fails mid-stream are all the same thing to a caller looking
+    /// for a frame: this tick has none. The backend's own error is kept as the
+    /// source rather than flattened into a string.
+    #[error("camera {index}: {source}")]
+    Camera {
+        index: u32,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// A decoded image does not match the [`Frame`] layout.
