@@ -419,7 +419,7 @@ mod tests {
         // assertion that separates a mean of the two eyes from the left eye
         // alone, which the block above cannot make: `ratio` on an all-zero eye is
         // `0.0`, so an implementation returning `ratio(points, &LEFT)`
-        // unconditionally reads exactly the same 0.3 up there and passes it — and
+        // unconditionally reads exactly the same 0.3 up there and passes it -- and
         // then reads `0.0` here, where the two eyes' ratios are `0.0` and `0.3`.
         // Averaging reads 0.15, which is neither.
         let mut right_only = landmarks();
@@ -444,14 +444,14 @@ mod tests {
         );
 
         // And with only the *left* eye's lids half shut, which takes its own ratio
-        // from 0.6 to 0.4 while the right eye stays at 0.3 — so the mean moves to
+        // from 0.6 to 0.4 while the right eye stays at 0.3 -- so the mean moves to
         // 0.35. This is the assertion that makes the mean a function of both eyes:
         // a reader that reported one of them, or a constant, cannot follow it from
         // 0.45 to 0.35, and neither can one that missed the left eye's lid move.
         //
         // The left eye is the one to half shut because the right eye's ratio is
         // *invariant* to its own lid gap: both of its pairs shorten together, so
-        // `lid` cancels out of it. Measured, not assumed — the right eye reads 0.3
+        // `lid` cancels out of it. Measured, not assumed -- the right eye reads 0.3
         // at every lid from 0 to 12, so a fixture that half shut *it* would assert
         // 0.45 twice and test one thing.
         let mut one = points;
