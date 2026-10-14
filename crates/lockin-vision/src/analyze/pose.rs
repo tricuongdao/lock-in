@@ -91,6 +91,20 @@
 //! the image because that is what a reader can check against a frame; the
 //! module's own tests pin each one against the projected landmarks.
 //!
+//! **The three angles are the principal representative of the rotation, which is
+//! not always the triple a caller might have written down.** `yaw` is
+//! `asin(R₂₀)` and `pitch` and `roll` are `atan2`s, so one rotation has more
+//! than one spelling and this module always returns the one whose `yaw` and
+//! `pitch` are inside ±90°. A head at yaw 100°, pitch −100°, roll 0° comes back
+//! as yaw 80°, pitch 80°, roll 180° — *the same rotation*: its landmarks are the
+//! same six pixels as that triple's, so the two are one input, and the answer
+//! says what the head is doing. `roll` is not bounded, so it is the angle that
+//! absorbs the difference. What is refused is a rotation whose principal
+//! representative still does not fit — an extraction that needs a pitch past
+//! ±90° — and `euler_of`'s recomposition check makes "the angles name the
+//! rotation they were read from" a property of the return value rather than of
+//! three reads that happened to look right.
+//!
 //! # `z` is ignored, deliberately
 //!
 //! Each landmark arrives as `[x, y, z]` and **this module reads `x` and `y`
@@ -123,7 +137,9 @@
 //! that trusts `z` far less than `x` and `y`.
 
 use crate::analyze::intrinsics::CameraIntrinsics;
-use nalgebra::{Matrix3, Matrix3x4, Matrix4, Rotation3, SMatrix, SVector, UnitQuaternion, Vector3};
+use nalgebra::{
+    Matrix3, Matrix3x4, Matrix4, Rotation3, SMatrix, SVD, SVector, UnitQuaternion, Vector3,
+};
 
 /// Points in a decoded landmark set.
 const LANDMARKS: usize = 468;
@@ -198,15 +214,19 @@ const FARTHEST_MM: f32 = 10_000.0;
 /// | 4.8 px | 6.0 m | 5.2° | 6/6 |
 /// | 2.9 px | 10 m | **19.6°** | 2/6 |
 ///
-/// The errors below about 12 px are large and erratic — one pixel of rounding
-/// is a fifth of the face — and the 2.9 px row is the failure this contract
-/// exists to prevent: a *frontal* face reported as 19.6° of pitch with
-/// `valid == true`. Twelve pixels is the last row that holds a few degrees over
-/// the whole pose sweep, and it is where this floor sits: a face about 2.4 m
-/// from a 640×480 webcam, or 4.8 m from a 1280×720 one. Past that the honest
-/// answer is no pose, because the landmarks cannot support one — and a missing
-/// pose is what Task 16 reads as "no evidence", where a wrong one is read as a
-/// head movement.
+/// Twelve pixels is a **margin above the erratic region**, not the best row in
+/// that table: the 9.6 px row already carries 8.3° of error and the 11.5 px row
+/// happens to be better than the 14.4 px one, because below about 12 px the
+/// error stops falling smoothly and starts depending on where the rounding
+/// lands. Twelve is the first whole number clear of that, and it is where this
+/// floor sits: a face about 2.4 m from a 640×480 webcam, or 4.8 m from a
+/// 1280×720 one. Past that the honest answer is no pose, because the landmarks
+/// cannot support one — and a missing pose is what Task 16 reads as "no
+/// evidence", where a wrong one is read as a head movement.
+///
+/// The floor is in pixels because the error it guards against is in pixels — the
+/// landmarks are whole numbers — which is also what makes it scale with
+/// resolution rather than with the frame.
 const MIN_SPREAD_PX: f32 = 12.0;
 
 /// How large a reprojection error is still a fit, as a fraction of the spread
@@ -254,14 +274,51 @@ const CONVERGED_STEP: f32 = 1e-6;
 
 /// How many times a step may be halved before the refinement gives up on it.
 ///
-/// Newton's step is only meaningful where the residual is defined, and the
-/// linear estimate can be far enough out that a full step carries a model point
-/// through the camera plane and out the other side. Halving is the cheapest way
-/// back inside; four halvings is a sixteenth of the step, far more than the
-/// overshoot a step from a sane initialisation needs. Measured: without it, a
-/// head pitched 80° — a pose the solver is otherwise exact on, between 75° and
-/// 85° both working — was refused outright.
+/// Four attempts: the full step, then a half, a quarter and an eighth. Newton's
+/// step is only meaningful where the residual is defined, and the linear
+/// estimate can be far enough out that a full step carries a model point through
+/// the camera plane and out the other side. Halving is the cheapest way back
+/// inside. Measured: without it, a head pitched 80° — a pose the solver is
+/// otherwise exact on, between 75° and 85° both working — was refused outright.
 const MAX_BACKTRACKS: usize = 4;
+
+/// The iteration cap every decomposition in this module runs under.
+///
+/// nalgebra's `svd` passes `max_niter = 0`, which its own documentation defines
+/// as "the algorithm continues indefinitely until convergence" — and an
+/// iteration whose convergence test compares against a NaN never converges.
+/// That is not hypothetical here: a mutant of this module reached the SVD with a
+/// NaN and hung a test process for nineteen minutes of CPU. `SVD::try_new` takes
+/// the cap instead, so every decomposition in this module is bounded by
+/// construction and a run that exceeds the cap is `None`, which the caller turns
+/// into [`HeadPose::INVALID`].
+///
+/// A hundred is far above what these systems need — a 12×12 DLT normal matrix
+/// and two 3×3 rotations, all well conditioned — and far below anything a
+/// 5 Hz frame budget would notice.
+const MAX_SVD_ITERATIONS: usize = 100;
+
+/// How far the rotation rebuilt from a returned [`Euler`] may sit from the
+/// rotation it was read off, element by element.
+///
+/// Three sine/cosine pairs and two products in `f32` are worth about `1e-7`; a
+/// decomposition that took the wrong branch is wrong by `O(1)`. `1e-4` sits two
+/// orders of magnitude clear of the arithmetic and four below any real error.
+const ROUND_TRIP_TOLERANCE: f32 = 1e-4;
+
+/// √3 — the mean distance Hartley normalisation targets in three dimensions, to
+/// the precision `f32` has for it. Spelled out as a literal because
+/// `f32::consts::SQRT_3` is still behind `more_float_constants` on the pinned
+/// toolchain.
+const SQRT_3: f32 = 1.732_050_8;
+
+/// [`MODEL`]'s own mean radius in millimetres: the distance from its centroid
+/// that the observed spread is the pixel-space image of.
+///
+/// A constant rather than a loop per frame, pinned by a test that recomputes it
+/// from [`MODEL`] — editing the model without editing this fails that test
+/// rather than quietly mis-scaling the fallback distance that uses it.
+const MODEL_RADIUS_MM: f32 = 46.99;
 
 /// Head rotation about the camera's three axes, in degrees.
 ///
@@ -369,7 +426,34 @@ fn solve(
     let observed = observed_points(points);
     let spread = spread_of(&observed)?;
     let (rotation, translation) = initial_pose(&observed, k)?;
-    let (rotation, translation, residual) = refine(rotation, translation, &observed, k)?;
+
+    // Two places to start the refinement from, and the better fit wins.
+    //
+    // The linear estimate is a good start almost everywhere and a bad one where
+    // the problem is ill-conditioned: rotation and distance are what a monocular
+    // solve trades against each other, and a face foreshortened to a third of
+    // its width is where that trade is worst. Measured, on the fixture the
+    // steep-pitch test uses: the linear estimate settles at a **17 px** residual
+    // on a 3.2 px allowance, and raising the iteration budget to a hundred does
+    // not move it — a different basin, not slow convergence.
+    //
+    // The second start needs no linear algebra at all: the face is at the
+    // distance its apparent size implies, looking straight ahead, and the
+    // refinement takes it from there. Measured on the same fixture, it converges
+    // to **0.2 px**. It costs one division and at most one more bounded
+    // refinement, and it only runs when the first attempt failed to fit.
+    let mut best = refine(rotation, translation, &observed, k).filter(|(_, _, r)| r.is_finite());
+    let fitted = best.map_or(f32::INFINITY, |(_, _, residual)| residual);
+    if !fitted.is_finite() || fitted > MAX_RESIDUAL_FRACTION * spread {
+        let (fallback, start) = weak_perspective_start(&observed, spread, k);
+        if let Some((rotation, translation, residual)) = refine(fallback, start, &observed, k)
+            && residual.is_finite()
+            && residual < fitted
+        {
+            best = Some((rotation, translation, residual));
+        }
+    }
+    let (rotation, translation, residual) = best?;
 
     // Does the pose actually explain the landmarks? Everything upstream fits
     // *some* pose to *any* six points; this is the only gate that asks whether
@@ -385,6 +469,42 @@ fn solve(
         return None;
     }
     Some(rotation)
+}
+
+/// The second starting point: a face square to the camera, at the distance its
+/// apparent size implies.
+///
+/// `z ≈ f·X/x` — the weak-perspective distance, exact for a face square to the
+/// camera and a usable starting point when it is not, because
+/// [`MODEL_RADIUS_MM`] and the observed spread are the same statistic measured
+/// in two spaces. The lateral parts of the translation follow from the face's
+/// centroid landing where it does on the sensor.
+///
+/// Deliberately **not** seeded with the linear estimate's rotation: at the
+/// configuration where this is needed, that rotation is the part that is wrong,
+/// and starting from it is what the measurement above rules out.
+fn weak_perspective_start(
+    observed: &[[f32; 2]; CORRESPONDENCES],
+    spread: f32,
+    k: &CameraIntrinsics,
+) -> (UnitQuaternion<f32>, Vector3<f32>) {
+    let mut centre = [0.0f32; 2];
+    for point in observed {
+        centre[0] += point[0];
+        centre[1] += point[1];
+    }
+    centre[0] /= CORRESPONDENCES as f32;
+    centre[1] /= CORRESPONDENCES as f32;
+
+    let depth = 0.5 * (k.fx + k.fy) * MODEL_RADIUS_MM / spread;
+    (
+        UnitQuaternion::identity(),
+        Vector3::new(
+            (centre[0] - k.cx) * depth / k.fx,
+            (centre[1] - k.cy) * depth / k.fy,
+            depth,
+        ),
+    )
 }
 
 /// The six correspondence points, `[x, y]` each, as the floating-point pixels
@@ -495,16 +615,18 @@ fn initial_pose(
         );
     }
     // nalgebra's SVD iterates rather than solving in one pass, and an iteration
-    // that reads a NaN has no termination argument at all: `f32::min`-style
-    // comparisons against a NaN are false, so its convergence test never fires.
-    // Everything above is finite for finite input, so this check cannot fire
-    // today — it is here because the alternative to an `Option` on this line is
-    // a camera thread that never returns, and it costs 144 comparisons on a
-    // solve that runs five times a second.
+    // that reads a NaN has no termination argument at all: comparisons against a
+    // NaN are false, so its convergence test never fires. Everything above is
+    // finite for finite input, so this check cannot fire today — it is here
+    // because the alternative to an `Option` on this line is a camera thread
+    // that never returns, and it costs 144 comparisons on a solve that runs five
+    // times a second.
     if !system.iter().all(|value| value.is_finite()) {
         return None;
     }
-    let decomposition = system.svd(true, true);
+    // `try_new`, not `svd`: the cap is what makes this terminate. See
+    // `MAX_SVD_ITERATIONS`.
+    let decomposition = SVD::try_new(system, true, true, f32::EPSILON, MAX_SVD_ITERATIONS)?;
     let v_t = decomposition.v_t?;
     // The singular values come back largest first, so the null space is the
     // last row: the direction the system squeezes hardest.
@@ -513,9 +635,9 @@ fn initial_pose(
 
     let projection = to_pixels.try_inverse()? * normalised * to_millimetres;
     let with_intrinsics = inverse_intrinsics(k) * projection;
-    // The same termination guard as above, for the two three-by-three SVDs
-    // below: a projection matrix can be finite on paper and still overflow
-    // through the multiplications that build it.
+    // The same termination guard as above, for the two three-by-three
+    // decompositions below: a projection matrix can be finite on paper and still
+    // overflow through the multiplications that build it.
     if !with_intrinsics.iter().all(|value| value.is_finite()) {
         return None;
     }
@@ -526,7 +648,8 @@ fn initial_pose(
     // one, so the mean singular value of the left block is λ's magnitude. Its
     // *sign* is the only thing the SVD leaves free, and it is fixed here by the
     // one fact about a head that is not in doubt: it is in front of the camera.
-    let singular = turn.svd(false, false).singular_values;
+    let singular =
+        SVD::try_new(turn, false, false, f32::EPSILON, MAX_SVD_ITERATIONS)?.singular_values;
     let magnitude = (singular[0] + singular[1] + singular[2]) / 3.0;
     if !magnitude.is_finite() || magnitude <= 0.0 || !offset.z.is_finite() || offset.z == 0.0 {
         return None;
@@ -534,7 +657,20 @@ fn initial_pose(
     let scale = if offset.z > 0.0 { 1.0 } else { -1.0 } / magnitude;
 
     let scaled = turn * scale;
-    let decomposition = scaled.svd(true, true);
+    // The last input to a decomposition, and the only one that a projection
+    // matrix's own arithmetic can turn into a NaN — `scale` divides by the
+    // magnitude checked above, so it is finite *today*, and "provably
+    // unreachable" is the argument this module already had falsified once.
+    if !scale.is_finite() || !scaled.iter().all(|value| value.is_finite()) {
+        return None;
+    }
+    // A three-by-three `try_new` cannot report a failure to converge: nalgebra
+    // computes the 3×3 case by eigendecomposition and its dispatcher discards
+    // that `Option` (an `unsafe` transmute in `try_new_unordered`). The cap
+    // still bounds the work; a non-convergent result arrives as a matrix of
+    // garbage instead of a `None`, which the finiteness checks on `rotation`
+    // below are what catch.
+    let decomposition = SVD::try_new(scaled, true, true, f32::EPSILON, MAX_SVD_ITERATIONS)?;
     let (mut u, v_t) = (decomposition.u?, decomposition.v_t?);
     let mut rotation = u * v_t;
     if rotation.determinant() < 0.0 {
@@ -659,15 +795,13 @@ fn normalise_3d() -> (Matrix4<f32>, [[f32; COORDINATES]; CORRESPONDENCES]) {
         .sqrt();
     }
     extent /= CORRESPONDENCES as f32;
-    // `MODEL` is a compile-time constant with six distinct points, so this
-    // cannot be zero or non-finite; the guard is here so that editing the model
-    // into a degenerate one fails loudly in the tests rather than quietly
-    // returning a pose that is arithmetic on nothing.
-    let scale = if extent.is_finite() && extent > 0.0 {
-        std::f32::consts::SQRT_2.sqrt() / extent
-    } else {
-        1.0
-    };
+    // `MODEL` is a compile-time constant with six distinct points, so this is a
+    // fixed positive number and there is nothing to fall back to. The model's
+    // own test pins the structure that keeps it so; a degenerate edit would send
+    // an infinity into the scale below, and the finiteness guards in the
+    // decomposition are what turn that into `None` rather than into a hang.
+    debug_assert!(extent.is_finite() && extent > 0.0, "MODEL has no extent");
+    let scale = SQRT_3 / extent;
 
     let mut normalised = [[0.0f32; COORDINATES]; CORRESPONDENCES];
     for (into, point) in normalised.iter_mut().zip(MODEL) {
@@ -862,11 +996,40 @@ fn euler_of(rotation: &UnitQuaternion<f32>) -> Option<Euler> {
     // refuses a pitch past it, so neither clamp can fire today; they are here
     // so that the bound is a property of the return value rather than of the
     // two functions that happen to produce it.
-    Some(Euler {
+    let euler = Euler {
         yaw: yaw.clamp(-90.0, 90.0),
         pitch: pitch.clamp(-90.0, 90.0),
         roll,
-    })
+    };
+    // Three angles read off three matrix elements are not a decomposition until
+    // they are put back together. Recomposing is the only check that looks at
+    // the whole rotation rather than at the elements the extraction happened to
+    // read, so it is what catches a branch taken the wrong side, a sign lost in
+    // the conversion, or the pair of angles that trade off against each other
+    // at a gimbal.
+    if !composes_to(&euler, matrix) {
+        return None;
+    }
+    Some(euler)
+}
+
+/// Whether the module's own composition of `euler` —
+/// `Rz(roll)·Ry(-yaw)·Rx(pitch)`, the one the docs state and the tests project —
+/// reproduces `matrix`.
+fn composes_to(euler: &Euler, matrix: &Matrix3<f32>) -> bool {
+    let (sy, cy) = euler.yaw.to_radians().sin_cos();
+    let (sp, cp) = euler.pitch.to_radians().sin_cos();
+    let (sr, cr) = euler.roll.to_radians().sin_cos();
+    let about_x = Matrix3::new(1.0, 0.0, 0.0, 0.0, cp, -sp, 0.0, sp, cp);
+    // `Ry(-yaw)`: the sign that makes positive yaw turn the face toward the
+    // image's right.
+    let about_y = Matrix3::new(cy, 0.0, -sy, 0.0, 1.0, 0.0, sy, 0.0, cy);
+    let about_z = Matrix3::new(cr, -sr, 0.0, sr, cr, 0.0, 0.0, 0.0, 1.0);
+    let rebuilt = about_z * about_y * about_x;
+    rebuilt
+        .iter()
+        .zip(matrix.iter())
+        .all(|(rebuilt, original)| (rebuilt - original).abs() <= ROUND_TRIP_TOLERANCE)
 }
 
 #[cfg(test)]
@@ -1039,7 +1202,7 @@ mod tests {
             // as a turn half as far.
             assert!(
                 turned.euler.yaw > yaw / 2.0,
-                "{yaw}° of yaw read as {}, which is not a quarter of the way there",
+                "{yaw}° of yaw read as {}, which is not even half of the way there",
                 turned.euler.yaw
             );
         }
@@ -1052,8 +1215,10 @@ mod tests {
     #[test]
     fn head_pose_is_bounded_and_never_nan() {
         let k = k();
-        // 468 copies of a single pixel: at the origin, mid-frame, and at the
-        // very edge of what an `i32` landmark can hold.
+        // Six collinear correspondence points: distinct pixels, no area, and no
+        // rigid face projects to a line. Distinct matters — this fixture is what
+        // kills a solve that measures the constellation from the frame's origin
+        // rather than from its own centre, which coincident points could not.
         let mut line = [[0i32; COORDINATES]; LANDMARKS];
         for (step, slot) in INDICES.iter().enumerate() {
             line[*slot] = [step as i32 * 90, step as i32 * 70, 0];
@@ -1083,6 +1248,14 @@ mod tests {
         // constellation, and the pose it implies is arithmetic noise: measured
         // at 19.6° of pitch for a face that is square to the camera.
         let across_the_room = project(Euler::default(), 11_000.0, &k);
+        // The same distance through a **long lens**, where the floor cannot
+        // help: a 4K frame's focal length is 3840 px, so a face 13 m away still
+        // spans 13 px of spread and passes the floor comfortably. What refuses
+        // it is the distance bound — which is the whole reason `FARTHEST_MM`
+        // exists rather than being left to the floor.
+        let long_lens = CameraIntrinsics::from_calibration(3840.0, 3840.0, 1920.0, 1080.0);
+        let far_through_a_long_lens = project(Euler::default(), 13_000.0, &long_lens);
+        let near_through_a_long_lens = project(Euler::default(), 700.0, &long_lens);
         let frontal = project(euler(20.0, 10.0, 5.0), 600.0, &k);
 
         let cases = [
@@ -1170,6 +1343,11 @@ mod tests {
             ("a face 30 mm from the lens", pressed, k),
             ("a frontal face eleven metres away", across_the_room, k),
             (
+                "a face thirteen metres away through a long lens",
+                far_through_a_long_lens,
+                long_lens,
+            ),
+            (
                 "zeroed intrinsics, as `from_frame` gives a zero-area frame",
                 frontal,
                 CameraIntrinsics::from_calibration(0.0, 0.0, 0.0, 0.0),
@@ -1200,8 +1378,13 @@ mod tests {
 
         // The same landmarks against working intrinsics still solve: the
         // rejections above are about the input, not about a solver that has
-        // stopped answering.
+        // stopped answering — and that includes the long lens, where the only
+        // rejected fixture is the one thirteen metres out.
         assert!(estimate_head_pose(&frontal, &k).valid);
+        assert!(
+            estimate_head_pose(&near_through_a_long_lens, &long_lens).valid,
+            "a 4K frame with a face 700 mm away is an ordinary pose"
+        );
     }
 
     #[test]
@@ -1324,6 +1507,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_extreme_rotation_comes_back_as_the_same_rotation_or_not_at_all() {
+        // A head turned and tipped past both of the angles this module promises
+        // to report. The two fixtures below are the *same pixels* — measured,
+        // all six correspondence points identical — because yaw 100°, pitch
+        // −100°, roll 0° and yaw 80°, pitch 80°, roll 180° are one rotation
+        // written two ways. So no implementation can accept one and refuse the
+        // other: what comes back is the principal representative of that single
+        // rotation, with |yaw| and |pitch| inside the promised ±90°, and the
+        // claim it makes about the head has to still be true.
+        let k = k();
+        let past = project(euler(100.0, -100.0, 0.0), 600.0, &k);
+        let inside = project(euler(80.0, 80.0, 180.0), 600.0, &k);
+        for index in INDICES {
+            assert_eq!(
+                past[index], inside[index],
+                "the two spellings of this rotation are the same landmarks"
+            );
+        }
+        assert_eq!(
+            estimate_head_pose(&past, &k),
+            estimate_head_pose(&inside, &k),
+            "and therefore the same answer"
+        );
+
+        for wanted in [
+            euler(100.0, -100.0, 0.0),
+            euler(80.0, 80.0, 180.0),
+            euler(100.0, -100.0, 30.0),
+            euler(89.0, 0.0, 0.0),
+        ] {
+            let pose = estimate_head_pose(&project(wanted, 600.0, &k), &k);
+            assert!(
+                pose.valid,
+                "a rotation this module can state is reported: {wanted:?} -> {pose:?}"
+            );
+            assert!(
+                pose.euler.yaw.abs() <= 90.0 && pose.euler.pitch.abs() <= 90.0,
+                "and stated inside the promised range: {pose:?}"
+            );
+            // The returned angles name the rotation the fixture projected — not
+            // a nearby one. The tolerance is the fixture's own rounding to whole
+            // pixels, measured at 7e-3 of matrix element on this constellation,
+            // where the module's own recomposition check inside `euler_of` runs
+            // at 1e-4 because it never sees a rounded landmark.
+            let projected = rotation(wanted);
+            let rebuilt = rotation(pose.euler);
+            let mut worst = 0.0f32;
+            for row in 0..3 {
+                for column in 0..3 {
+                    worst = worst.max((projected[row][column] - rebuilt[row][column]).abs());
+                }
+            }
+            assert!(
+                worst < 0.05,
+                "{wanted:?} came back as {:?}, which is a different rotation ({worst})",
+                pose.euler
+            );
+        }
+
+        // And the rotations this representation genuinely cannot state are still
+        // refused rather than re-labelled: past the yaw singularity the aliased
+        // triple needs a pitch outside ±90°, which is what the gate catches.
+        assert_eq!(
+            estimate_head_pose(&project(euler(95.0, 0.0, 0.0), 600.0, &k), &k),
+            HeadPose::INVALID,
+            "past the yaw singularity there is no triple inside the range"
+        );
     }
 
     #[test]
@@ -1515,6 +1768,32 @@ mod tests {
         assert!(
             width > 60.0 && height > 90.0 && width < height,
             "an adult face: {width} mm across the eyes, {height} mm from the eye line to the chin"
+        );
+
+        // And the model's own mean radius, which is a constant because the
+        // fallback distance divides by it: recomputed here from the model it
+        // describes, so editing the model without editing the constant fails
+        // this rather than mis-scaling every fallback distance.
+        let mut centre = [0.0f32; COORDINATES];
+        for point in MODEL {
+            for (axis, value) in centre.iter_mut().enumerate() {
+                *value += point[axis];
+            }
+        }
+        for value in centre.iter_mut() {
+            *value /= CORRESPONDENCES as f32;
+        }
+        let mut radius = 0.0f32;
+        for point in MODEL {
+            radius += ((point[0] - centre[0]).powi(2)
+                + (point[1] - centre[1]).powi(2)
+                + (point[2] - centre[2]).powi(2))
+            .sqrt();
+        }
+        radius /= CORRESPONDENCES as f32;
+        assert!(
+            (radius - MODEL_RADIUS_MM).abs() < 0.01,
+            "MODEL_RADIUS_MM must be the model's own mean radius: it is {MODEL_RADIUS_MM}, the model says {radius}"
         );
     }
 
