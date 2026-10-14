@@ -420,6 +420,12 @@ mod tests {
         values(tensor)[channel * INPUT_SIZE * INPUT_SIZE + row * INPUT_SIZE + column]
     }
 
+    /// The green plane, in tensor order.
+    fn greens(tensor: &InputTensor) -> impl Iterator<Item = f32> + '_ {
+        let plane = INPUT_SIZE * INPUT_SIZE;
+        values(tensor)[plane..2 * plane].iter().copied()
+    }
+
     #[test]
     fn index_zero_is_closed_and_index_one_is_open() {
         // R14. OpenVINO's README says `[open, closed]`; its accuracy-checker
@@ -535,6 +541,62 @@ mod tests {
         assert!(
             red < 0.6,
             "and divided by 255 after: without it red would be 128, got {red}"
+        );
+    }
+
+    #[test]
+    fn preprocessing_squeezes_a_non_square_box_to_32x32() {
+        // The spec's eye box is square — 1.8x the inter-landmark eye distance,
+        // roll-corrected — so *every* box the real caller produces has
+        // `w == h`, and at `w == h` the two axes' steps are the same number.
+        // That makes a whole class of bug invisible: a `step_y` computed from
+        // `width`, or a `step_x` from `height`, behaves identically on every
+        // square box and is only wrong on the boxes no test was using.
+        //
+        // So this uses a deliberately non-square one. It is the only test here
+        // that can tell the two axes' steps apart, and without it the squeeze
+        // that `preprocess` documents is a claim no test checks.
+        let frame = frame_with(64, 64, |x, y| (x as u8, y as u8, 0));
+
+        // 32 wide and 16 tall at (8, 16): the horizontal step is exactly 1.0, so
+        // tensor columns land on frame columns 8..=39, while the vertical step is
+        // 0.5, stretching the box's 16 rows across all 32 output rows.
+        let eye_box = rect(8.0, 16.0, 32.0, 16.0);
+        let tensor = preprocess(&frame, &eye_box);
+
+        assert_eq!(tensor.shape, vec![1, 3, 32, 32], "the box is squeezed flat");
+
+        // Blue, the column: unaffected by the aspect, and pinned at both ends so
+        // that `step_x` is the box's width and not its height.
+        assert_eq!(at(&tensor, 0, 0, 0), expected(8.0), "the box's left column");
+        assert_eq!(
+            at(&tensor, 0, 31, 0),
+            expected(39.0),
+            "and its right column, 32 columns of content across 32 outputs"
+        );
+
+        // Green, the row. Output row 0 samples frame row 15.75 and output row 31
+        // samples 31.25 — 16 rows of content spread over 32, so the last output
+        // row is still *inside* the box. Had `step_y` come from `width`, the
+        // step would be 1.0 and these would be 16.0 and 47.0: the sampling would
+        // run 16 rows past the box's own bottom edge.
+        assert_eq!(at(&tensor, 1, 0, 0), expected(15.75), "row 0 samples 15.75");
+        assert_eq!(
+            at(&tensor, 1, 0, 31),
+            expected(31.25),
+            "row 31 samples 31.25, not 47"
+        );
+
+        // The whole green plane stays inside the box's rows, which is the same
+        // claim as a range rather than at two sampled points. The plane is a
+        // linear ramp — 15.75 + 0.5 * row — so the extremes are the endpoints.
+        assert_eq!(
+            greens(&tensor).fold(f32::INFINITY, f32::min),
+            expected(15.75)
+        );
+        assert_eq!(
+            greens(&tensor).fold(f32::NEG_INFINITY, f32::max),
+            expected(31.25)
         );
     }
 
