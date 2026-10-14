@@ -431,39 +431,46 @@ mod tests {
              a left-eye-only reader gets wrong"
         );
 
-        // Both eyes open: the mirror of that shape, whose own ratio is also 0.6,
-        // so the mean is 0.45 rather than the 0.6 either eye has alone. That is
-        // what a reader returning one eye, summing them (1.2) or taking the
-        // larger (0.6) fails.
+        // Both eyes fully open, and the two are *not* the same number: the mirror
+        // reverses which of each lid pair is the upper point, which leaves the
+        // right eye's pairs 12 px apart where the left's are 24, so it reads 0.3
+        // against the left's 0.6 and the mean is 0.45.
         let mut both = points;
         right_eye_open(&mut both);
         assert!(
             close(ear(&both), 0.45),
-            "the mean of two 0.6 eyes, got {}",
+            "the mean of 0.6 and 0.3, got {}",
             ear(&both)
         );
 
-        // And one eye at a time: the left stays open at 0.6 while the right eye's
-        // lids half shut, which halves its own ratio to 0.3 -- so this mean is
-        // 0.45 as well, reached from two *different* numbers. That is the
-        // assertion that separates averaging from picking the smaller (0.3) or
-        // the larger (0.6), which the fixture above cannot distinguish.
+        // And with only the *left* eye's lids half shut, which takes its own ratio
+        // from 0.6 to 0.4 while the right eye stays at 0.3 — so the mean moves to
+        // 0.35. This is the assertion that makes the mean a function of both eyes:
+        // a reader that reported one of them, or a constant, cannot follow it from
+        // 0.45 to 0.35, and neither can one that missed the left eye's lid move.
+        //
+        // The left eye is the one to half shut because the right eye's ratio is
+        // *invariant* to its own lid gap: both of its pairs shorten together, so
+        // `lid` cancels out of it. Measured, not assumed — the right eye reads 0.3
+        // at every lid from 0 to 12, so a fixture that half shut *it* would assert
+        // 0.45 twice and test one thing.
         let mut one = points;
-        place_eye_mirrored(
+        place_eye(
             &mut one,
             &eye_shape(
-                R_OUTER,
-                R_UPPER_OUTER,
-                R_UPPER_INNER,
-                R_INNER,
-                R_LOWER_INNER,
-                R_LOWER_OUTER,
-                6,
+                L_OUTER,
+                L_UPPER_OUTER,
+                L_UPPER_INNER,
+                L_INNER,
+                L_LOWER_INNER,
+                L_LOWER_OUTER,
+                8,
             ),
         );
+        right_eye_open(&mut one);
         assert!(
-            close(ear(&one), 0.45),
-            "the mean of 0.6 and 0.3, got {}",
+            close(ear(&one), 0.35),
+            "the mean of 0.4 and 0.3, got {}",
             ear(&one)
         );
 
