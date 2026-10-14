@@ -6,4 +6,5 @@
 pub mod analyze;
 pub mod capture;
 pub mod frame;
+pub mod models;
 pub mod motion;
