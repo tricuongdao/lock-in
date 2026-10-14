@@ -410,12 +410,26 @@ mod tests {
         //
         // Only the left eye is placed here, so the right eye's six indices are
         // still at the origin and its ratio is the `0.0` that `ratio` returns for
-        // an eye with no width. The mean of `0.6` and `0.0` is what this reads,
-        // and it is a *different* assertion from the one below rather than a
-        // duplicate of it.
+        // an eye with no width. The mean of `0.6` and `0.0` is what this reads.
         let mut points = landmarks();
         left_eye_open(&mut points);
         assert_eq!(ear(&points), 0.3, "one 0.6 eye and one empty eye");
+
+        // And now only the *right*, with the left untouched. This is the
+        // assertion that separates a mean of the two eyes from the left eye
+        // alone, which the block above cannot make: `ratio` on an all-zero eye is
+        // `0.0`, so an implementation returning `ratio(points, &LEFT)`
+        // unconditionally reads exactly the same 0.3 up there and passes it — and
+        // then reads `0.0` here, where the two eyes' ratios are `0.0` and `0.3`.
+        // Averaging reads 0.15, which is neither.
+        let mut right_only = landmarks();
+        right_eye_open(&mut right_only);
+        assert_eq!(
+            ear(&right_only),
+            0.15,
+            "an empty left eye and a 0.3 right eye: the mirror case, and the one \
+             a left-eye-only reader gets wrong"
+        );
 
         // Both eyes open: the mirror of that shape, whose own ratio is also 0.6,
         // so the mean is 0.45 rather than the 0.6 either eye has alone. That is
