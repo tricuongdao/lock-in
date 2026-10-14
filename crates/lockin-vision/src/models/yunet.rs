@@ -201,6 +201,21 @@ impl LetterboxGeometry {
             (y - self.top as f32) * inverse_scale,
         )
     }
+
+    /// The exact algebraic inverse of [`to_frame`](Self::to_frame).
+    ///
+    /// Only a test uses this, and that is the point: it is the *wrong* direction
+    /// for sampling — handing it a tensor coordinate multiplies by the scale and
+    /// magnifies a corner of the frame instead of covering it — so it exists to
+    /// be asserted against rather than called. The round trip
+    /// `to_frame(to_tensor(p)) == p` is what proves `to_frame` is the inverse of
+    /// a well-defined forward map, which is the property `preprocess` and
+    /// `decode` both rely on when they use `to_frame` in opposite roles.
+    #[cfg(test)]
+    fn to_tensor(self, x: f32, y: f32) -> (f32, f32) {
+        let scale = if self.scale > 0.0 { self.scale } else { 1.0 };
+        (x * scale + self.left as f32, y * scale + self.top as f32)
+    }
 }
 
 /// Builds the letterboxed NCHW tensor YuNet expects from `frame`.
@@ -216,9 +231,19 @@ impl LetterboxGeometry {
 pub fn preprocess(frame: &Frame) -> (InputTensor, LetterboxGeometry) {
     let geometry = letterbox_geometry(frame.width, frame.height);
 
-    // The content is centred, so the rows to sample into are the content band;
-    // the zero fill leaves the padding around it zero.
-    let content = geometry.top..geometry.top + geometry.content_height();
+    // The content is centred on *both* axes, so both bands carry their offset.
+    // Writing `0..content_width` horizontally instead of `left..left +
+    // content_width` is a bug that hides itself: `to_frame` subtracts `left`, so
+    // every column before `left` samples the frame's first column again — the
+    // left padding fills with a smeared copy of the frame's edge instead of
+    // zeros — and the columns from `left + content_width` to the tensor's edge
+    // are never written at all, so the frame's right-hand strip is never seen by
+    // the model. Detection coordinates stay self-consistent because `decode`
+    // inverts the same map, which is what makes it invisible content loss
+    // rather than a visible shift. It only bites when the frame is portrait
+    // (`left > 0`), which is why a portrait fixture is the test for it.
+    let columns = geometry.left..geometry.left + geometry.content_width();
+    let rows = geometry.top..geometry.top + geometry.content_height();
 
     // The whole tensor at once, rather than three channel buffers to copy in
     // afterwards: at 5 Hz this runs 200 times a minute and the copy would be
@@ -226,16 +251,15 @@ pub fn preprocess(frame: &Frame) -> (InputTensor, LetterboxGeometry) {
     let plane = TENSOR_WIDTH * TENSOR_HEIGHT;
     let mut data = vec![0.0f32; plane * 3];
 
-    for y in content {
-        for x in 0..geometry.content_width() {
-            // `to_frame`, not `to_tensor`: `x` and `y` here are *tensor*
-            // coordinates, and the question is which frame position that tensor
-            // position came from. Using the frame-to-tensor map instead would
-            // multiply by the scale where it must divide — a 1280x720 frame
-            // would sample a magnified corner crop and clamp everything else to
-            // that crop's edge, so no face outside the crop could ever be
-            // detected, and every box the decode produced would describe pixels
-            // the model never saw.
+    for y in rows.clone() {
+        for x in columns.clone() {
+            // `to_frame`, not the frame-to-tensor map: `x` and `y` here are
+            // *tensor* coordinates, and the question is which frame position
+            // that tensor position came from. Multiplying by the scale where it
+            // must divide would sample a magnified corner crop and clamp
+            // everything else to that crop's edge, so no face outside the crop
+            // could ever be detected, and every box the decode produced would
+            // describe pixels the model never saw.
             let (source_x, source_y) = geometry.to_frame(x as f32, y as f32);
             let (b, g, r) = sample_bilinear(frame, source_x, source_y);
             let index = y * TENSOR_WIDTH + x;
@@ -398,25 +422,24 @@ fn finish(candidates: Vec<FaceBox>) -> Vec<FaceBox> {
         .collect();
     nms(&mut detections, NMS_IOU_THRESHOLD, 0.0);
 
-    // `nms` reorders what it keeps and returns them strongest first, so the
-    // survivors are mapped back to the candidates they came from and the
-    // candidate list is filtered *in place*. That keeps this a single order —
-    // the one `nms` already established — instead of a second sort that would
-    // have to agree with it.
-    let mut survived = vec![false; candidates.len()];
+    // `nms` reorders what it keeps — strongest first, which is the order
+    // `YuNet::detect` documents — so the survivors are walked *in `nms`'s
+    // order* and each one is resolved back to the candidate it came from.
+    //
+    // The tempting alternative is to mark a `survived` flag per candidate and
+    // then filter `candidates` in place. That is wrong, and wrong invisibly:
+    // candidates are in *grid* order (stride 8 row by row, then 16, then 32),
+    // not score order, so filtering them returns whatever the scan order
+    // happened to be. A stride-8 cell scoring 0.7 that the scan reached first
+    // would come back ahead of a later one scoring 0.9, and every caller that
+    // takes `faces[0]` as the most confident face would take the wrong one.
+    let mut kept = Vec::with_capacity(detections.len());
     for detection in &detections {
-        if let Some(position) = candidates
+        let position = candidates
             .iter()
             .position(|face| face.score == detection.score && face.rect == detection.rect)
-        {
-            survived[position] = true;
-        }
-    }
-    let mut kept = Vec::with_capacity(detections.len());
-    for (index, face) in candidates.into_iter().enumerate() {
-        if survived[index] {
-            kept.push(face);
-        }
+            .expect("nms only ever returns detections it was given");
+        kept.push(candidates[position]);
     }
     kept
 }
@@ -592,34 +615,30 @@ fn decode_cell(
     let frame_right = frame_right.clamp(-reach, reach);
     let frame_bottom = frame_bottom.clamp(-reach, reach);
 
-    // Clamped again in frame space, and the vertical pair is *not* redundant
-    // with the clamp above. That one bounds a box to the whole tensor, but the
-    // letterbox pads whichever axis is not the tighter one, so a box whose
-    // origin falls in the top padding has a tensor-space top that is perfectly
-    // legal — say 0 — and a frame-space top that is negative, and a box ending
-    // inside the tensor can still project a fraction past the frame's last row,
-    // because the inverse map scales the frame's height up by more than the
-    // tensor holds. Without these, `Rect` would carry a negative origin and a
-    // negative height, and nothing downstream checks that: `Rect` has no
-    // non-negativity invariant and `Rect::iou` reads a negative-origin box as
-    // having positive area, so Face Mesh would be handed a crop outside the
-    // image.
+    // Clamped again in frame space, and this is *not* redundant with the clamp
+    // above — on either axis. That one bounds a box to the whole tensor, but the
+    // letterbox pads whichever axis is not the tighter one, and the padding is
+    // inside the tensor. So a box whose origin falls in the padding has a
+    // tensor-space edge that is perfectly legal (0, or the tensor's own width)
+    // and a frame-space edge that is outside the frame: a negative origin from
+    // the top or left padding, and an end past the frame's last row or column
+    // from the bottom or right. That happens whenever the frame is not the
+    // tensor's aspect ratio in that axis — a portrait 480x640 frame has `left =
+    // 80`, so the left padding is a real region that a box can land in, not a
+    // hypothetical one.
     //
-    // The horizontal pair cannot be reached, and this is the honest note about
-    // it: the letterbox's content spans the tensor's full width by
-    // construction, so the inverse map sends `[0, TENSOR_WIDTH]` to
-    // `[0, frame_width]` exactly, and `frame_left` is never outside the frame
-    // to begin with. They are kept because the guarantee is a property of
-    // `letterbox_geometry` that a later change could break without touching
-    // this function, and because a clamp that is a no-op is cheaper than the
-    // argument that it is one — but no test can pin them, and none pretends to.
+    // Without these clamps `Rect` would carry a negative origin and a negative
+    // height, and nothing downstream checks that: `Rect` has no non-negativity
+    // invariant and `Rect::iou` reads a negative-origin box as having positive
+    // area, so Face Mesh would be handed a crop outside the image.
     //
-    // The sizes are *derived* rather than clamped in their own right. Both
-    // endpoints land in `0..frame_width` / `0..frame_height`, and `to_frame`
-    // preserves their order, so the right edge is never left of the left one
-    // and a `max(0.0)` there would be a second guard for something the
-    // arithmetic has already established. Stating it by construction is what
-    // makes it checkable: a `max` that can never fire cannot be tested.
+    // The sizes are *derived* from the clamped endpoints rather than clamped in
+    // their own right. `to_frame` preserves the left-to-right order of its
+    // inputs and both endpoints land in `0..frame_width`, so the right edge is
+    // never left of the left one and a `max(0.0)` there would be a second guard
+    // for something the arithmetic has already established — and a guard that
+    // cannot fire cannot be tested, which is why there is one `debug_assert!`
+    // stating the whole contract instead of two silent floors.
     let (frame_width, frame_height) = frame;
     let x = frame_left.clamp(0.0, frame_width);
     let y = frame_top.clamp(0.0, frame_height);
@@ -696,11 +715,18 @@ mod tests {
         anchor_count(TENSOR_WIDTH, TENSOR_HEIGHT, stride)
     }
 
+    /// The grid columns one stride has over an arbitrary input width.
+    ///
+    /// Calls the *production* function rather than repeating its expression: a
+    /// copy would keep passing if the decode's own arithmetic were changed,
+    /// which is the bug this pair of tests exists to catch.
+    fn columns_for(width: usize, stride: usize) -> usize {
+        anchor_columns(width, stride)
+    }
+
     /// The grid rows one stride has over an arbitrary input height.
     ///
-    /// Calls the *production* function rather than repeating its expression:
-    /// a copy would keep passing if the decode's own arithmetic were changed,
-    /// which is exactly the bug this test exists to catch.
+    /// Calls the *production* function for the same reason as [`columns_for`].
     fn rows_for(height: usize, stride: usize) -> usize {
         anchor_rows(height, stride)
     }
@@ -754,7 +780,7 @@ mod tests {
         deltas: [f32; BOX_COLUMNS],
         landmarks: [(f32, f32); LANDMARKS],
     ) {
-        let anchor = grid_y * TENSOR_WIDTH.div_ceil(stride) + grid_x;
+        let anchor = grid_y * anchor_columns(TENSOR_WIDTH, stride) + grid_x;
         for output in outputs.iter_mut() {
             let (head, head_stride) = output
                 .name
@@ -992,14 +1018,40 @@ mod tests {
         channel(solid[plane + row], 20, "plane 1 is green");
         channel(solid[2 * plane + row], 30, "plane 2 is red");
 
-        // There is deliberately no "the two maps are inverses" assertion here.
-        // They are not, and cannot be: `to_frame` maps a tensor *position* to a
-        // frame position, while sampling needs the frame pixel *centre* that a
-        // tensor pixel covers, which differs by half a pixel — the same half
-        // pixel every resampler has. Asserting a round trip would be asserting
-        // something false. What is checkable is what the tests above do: that a
-        // tensor pixel reads the frame pixel it should, in the direction
-        // `preprocess` actually samples.
+        // `to_frame` and `to_tensor` are exact algebraic inverses, and that is
+        // worth asserting even though only `to_frame` is used by the crate:
+        // `preprocess` samples with it and `decode` inverts boxes with it, so if
+        // it were not the inverse of a well-defined forward map the two would
+        // disagree about where the frame *is*, and every box would be displaced
+        // by however much they differed.
+        //
+        // The composition asserted is `to_frame` after `to_tensor`, which is the
+        // pair that composes: `to_tensor` maps a frame position into the tensor
+        // and `to_frame` brings it back. (Separately, sampling needs the frame
+        // pixel *centre* a tensor pixel covers, which is half a pixel off
+        // `to_frame` — that is the resampler's own convention and is pinned by
+        // the pixel-value assertions above, not here.)
+        for point in [(0.0, 0.0), (3.0, 1.0), (1.5, 0.5), (2.75, 1.25)] {
+            let (tensor_x, tensor_y) = geometry.to_tensor(point.0, point.1);
+            let (back_x, back_y) = geometry.to_frame(tensor_x, tensor_y);
+            assert!(
+                (back_x - point.0).abs() < 1e-3 && (back_y - point.1).abs() < 1e-3,
+                "frame {point:?} -> tensor ({tensor_x}, {tensor_y}) -> ({back_x}, {back_y})"
+            );
+        }
+
+        // The same round trip through a *padded* geometry, where the offsets are
+        // non-zero on both axes — the composition the square case above cannot
+        // distinguish from an unpadded one.
+        let portrait = letterbox_geometry(480, 640);
+        for point in [(0.0, 0.0), (479.0, 639.0), (120.0, 300.0)] {
+            let (tensor_x, tensor_y) = portrait.to_tensor(point.0, point.1);
+            let (back_x, back_y) = portrait.to_frame(tensor_x, tensor_y);
+            assert!(
+                (back_x - point.0).abs() < 1e-3 && (back_y - point.1).abs() < 1e-3,
+                "frame {point:?} -> tensor ({tensor_x}, {tensor_y}) -> ({back_x}, {back_y})"
+            );
+        }
     }
 
     #[test]
@@ -1130,8 +1182,9 @@ mod tests {
             [(0.0, 0.0); LANDMARKS],
         );
         // Cell (2, 2) at stride 32 anchors at tensor (64, 64). Deltas of 4.0
-        // cells reach `(2 + 4) * 32 = 192`, so the centre is tensor (192, 160),
-        // frame (1.2, 0.0), with a 32x32 tensor box — 0.2x0.2 frame pixels.
+        // cells reach `(2 + 4) * 32 = 192` on *both* axes, so the centre is
+        // tensor (192, 192), frame (1.2, 0.2), with a 32x32 tensor box — 0.2x0.2
+        // frame pixels.
         set_cell(
             &mut outputs,
             2,
@@ -1193,6 +1246,20 @@ mod tests {
              bottom strip of the frame"
         );
         assert_eq!(rows_for(240, 8), 30);
+        assert_eq!(
+            columns_for(240, 32),
+            8,
+            "a width of 240 is 7 whole cells of 32 plus 16 columns, so the grid \
+             has 8 columns — the same ceiling on the other axis, and the one a \
+             truncating `anchor_columns` would get wrong"
+        );
+        assert_eq!(columns_for(240, 8), 30);
+        assert_eq!(
+            columns_for(TENSOR_WIDTH, 32),
+            20,
+            "and at the shipping size the two agree, which is why the \
+             assertion above is the one that does the work"
+        );
         assert_eq!(
             rows_for(TENSOR_HEIGHT, 32),
             20,
@@ -1324,10 +1391,12 @@ mod tests {
             [7.5, 15.0, raw_size(40.0, 8.0), raw_size(50.0, 8.0)],
             [(0.0, 0.0); LANDMARKS],
         );
-        // Cell (11, 10): the anchor moves 8 tensor pixels right and `dx` moves
-        // 2.5 cells back left, so this box starts 8 tensor pixels right of the
-        // first — frame x 0.8 against 0.75 — and the two overlap over 32 of 40
-        // columns. IoU 0.76, well over the 0.3 threshold.
+        // Cell (11, 10): the anchor moves 8 tensor pixels right but `dx = 5.0`
+        // instead of 7.5 pulls the centre 20 tensor pixels *left*, so this box
+        // starts 12 tensor pixels left of the first — frame x 0.675 against
+        // 0.75 — with the same 40x50 size. They share 28 of 40 columns and all
+        // 50 rows, so the intersection is 28*50 and the union is 2*2000 less it:
+        // an IoU of 0.538, comfortably over the 0.3 threshold.
         set_cell(
             &mut outputs,
             11,
@@ -1379,6 +1448,143 @@ mod tests {
             boxes,
             vec![(750, 94, 250, 313), (1125, 0, 250, 156)],
             "the second cell's box was suppressed and both faces survived"
+        );
+    }
+
+    #[test]
+    fn faces_come_back_strongest_first_not_in_scan_order() {
+        // `YuNet::detect` documents "strongest first" and `nms` returns that
+        // order, so a caller taking `faces[0]` gets the most confident face.
+        //
+        // The trap this pins is a scan-order bug that every other test is blind
+        // to, because in all of them grid order and score order happen to
+        // coincide. The candidates are collected in *grid* order — stride 8 row
+        // by row, then 16, then 32 — so here the cell the scan reaches first
+        // scores 0.7 and a later one scores 0.9. Returning them in the order
+        // they were collected would put 0.7 first.
+        let mut outputs = zero_outputs();
+        // Cell (1, 1) is the third anchor the stride-8 scan visits, and it is
+        // the *weaker* of the two.
+        set_cell(
+            &mut outputs,
+            1,
+            1,
+            8,
+            class_for(0.7),
+            1.0,
+            [7.5, 15.0, raw_size(40.0, 8.0), raw_size(50.0, 8.0)],
+            [(0.0, 0.0); LANDMARKS],
+        );
+        // Cell (10, 10) is visited hundreds of anchors later and is stronger.
+        set_cell(
+            &mut outputs,
+            10,
+            10,
+            8,
+            class_for(0.9),
+            1.0,
+            [7.5, 15.0, raw_size(40.0, 8.0), raw_size(50.0, 8.0)],
+            [(0.0, 0.0); LANDMARKS],
+        );
+
+        let geometry = letterbox_geometry(640, 480);
+        let faces = decode(&outputs, &geometry).expect("decodes");
+        assert_eq!(faces.len(), 2, "two cells, two faces: {faces:?}");
+        assert_eq!(
+            faces.iter().map(|face| face.score).collect::<Vec<_>>(),
+            vec![0.9, 0.7],
+            "the later-scanned cell scored higher and must still come first"
+        );
+        assert!(
+            faces[0].rect.x > faces[1].rect.x,
+            "and it is genuinely the other face, not the same one twice: {:?}",
+            faces.iter().map(|face| face.rect).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn a_portrait_frame_fills_the_tensor_without_smearing_its_edge() {
+        // Every other fixture is landscape or square, and that is why the bug
+        // this test exists for survived: when `width < height` the letterbox
+        // pads *horizontally*, so `left > 0`, and the content band has to carry
+        // that offset on both axes.
+        //
+        // Writing the columns as `0..content_width` instead fills the left
+        // padding with a smeared copy of the frame's first column and leaves the
+        // right-hand strip of the frame unsampled — invisible content loss,
+        // because `decode` inverts the same map and the coordinates stay
+        // self-consistent.
+        //
+        // A 480x640 frame against the square tensor scales by 1.0 (the height is
+        // already 640) and is padded 80 columns either side.
+        let frame = coordinate_frame(480, 640);
+        let (tensor, geometry) = preprocess(&frame);
+        assert_eq!(geometry.scale, 1.0f32);
+        assert_eq!(
+            (geometry.left, geometry.top),
+            (80, 0),
+            "the *narrow* axis is the one that gets padded"
+        );
+        assert_eq!(geometry.content_width(), 480);
+        assert_eq!(geometry.content_height(), 640);
+
+        let plane = TENSOR_WIDTH * TENSOR_HEIGHT;
+        let data = tensor.data.as_f32().expect("f32");
+        let at = |channel: usize, x: usize, y: usize| data[channel * plane + y * TENSOR_WIDTH + x];
+        let channel = |got: f32, want: u16, what: &str| {
+            assert!(
+                (got * 255.0 - want as f32).abs() < 1e-3,
+                "{what}: want {want}/255, got {}",
+                got * 255.0
+            );
+        };
+
+        // The left padding is genuinely zero, not a copy of frame column 0.
+        // This is the assertion the un-offset loop fails: it samples `to_frame(0,
+        // y) = -80`, which clamps to frame column 0, so every one of these
+        // columns would hold a replica of the frame's first column.
+        for x in [0, 1, 40, 79] {
+            assert_eq!(at(0, x, 0), 0.0, "left padding column {x} is zero");
+            assert_eq!(at(1, x, 0), 0.0, "left padding column {x} is zero");
+        }
+        // The content starts exactly where the padding ends, and the frame's
+        // own first column lands there.
+        channel(at(0, 80, 0), 0, "tensor column 80 is frame column 0");
+        channel(at(1, 80, 0), 0, "and frame row 0");
+        // Inside the first 256 frame columns the fixture does not wrap, so these
+        // read their own column number.
+        channel(at(0, 200, 0), 120, "tensor column 200 is frame column 120");
+        channel(
+            at(0, 335, 0),
+            255,
+            "and tensor column 335 is frame column 255",
+        );
+
+        // The frame's *right-hand* strip reaches the tensor. This is the
+        // assertion the un-offset loop fails: it stops at tensor column 479 —
+        // frame column 399 — so columns 480 onward are never written and read 0.
+        // Past frame column 255 the fixture's blue byte wraps (479 % 256 = 223),
+        // so the numbers below are the wrapped ones; what matters is that they
+        // are the *right* wrapped numbers rather than zero.
+        channel(at(0, 480, 0), 144, "tensor column 480 is frame column 400");
+        channel(
+            at(0, 559, 0),
+            223,
+            "and the last content column is frame x = 479, wrapped",
+        );
+        // Past the content is padding again, and zero.
+        assert_eq!(at(0, 560, 0), 0.0, "the right padding is zero");
+        assert_eq!(at(0, 639, 0), 0.0, "out to the tensor's last column");
+
+        // The frame's last row comes through too, so the vertical band is not
+        // the thing compensating for a horizontal mistake. These read their rows
+        // modulo 256, the fixture being byte-valued: 639 % 256 = 127.
+        channel(at(1, 80, 200), 200, "frame row 200 reads as itself");
+        channel(at(1, 80, 383), 127, "frame row 383 reads as itself");
+        channel(
+            at(1, 80, 639),
+            127,
+            "and the last content row is 639, wrapped",
         );
     }
 
@@ -1478,6 +1684,11 @@ mod tests {
             Err(ModelError::UnexpectedDataLength { name: "kps_8", .. })
         ));
 
+        // The right *column* count with the wrong row count: a graph exported
+        // over a different input size, or a stride set this decode does not
+        // share. 1580 is deliberately a plausible number — it is what a 320x240
+        // input produced in an earlier revision of this file — so this is the
+        // case where a stale constant would otherwise slip through unnoticed.
         let mut wrong_shape = zero_outputs();
         wrong_shape[0].shape = vec![1, 1580, CLASS_COLUMNS as i64];
         assert!(matches!(

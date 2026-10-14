@@ -82,7 +82,7 @@ impl TensorData {
 pub struct InputTensor {
     /// The graph input's name, e.g. `input` for YuNet.
     pub name: String,
-    /// The tensor's dimensions, outermost first — `[1, 3, 240, 320]` (NCHW)
+    /// The tensor's dimensions, outermost first — `[1, 3, 640, 640]` (NCHW)
     /// for a YuNet frame. Signed, because that is how ONNX Runtime reports
     /// them and a symbolic dimension is a `-1`.
     pub shape: Vec<i64>,
@@ -256,15 +256,22 @@ impl FakeSession {
     /// A clonable, shared handle to this session's recording.
     ///
     /// The handle outlives the boxed session, so a test can keep asking what
-    /// the wrapper sent after the wrapper has taken ownership:
+    /// the wrapper sent after the wrapper has taken ownership. For YuNet — whose
+    /// graph takes one `[1, 3, 640, 640]` image and returns twelve heads — that
+    /// reads:
     ///
     /// ```ignore
-    /// let session = FakeSession::zeros("yunet", 1, 1580 * 15);
+    /// let session = FakeSession::zeros("yunet", 12, &[1, 6400, 1]);
     /// let handle = session.handle();
     /// let yunet = YuNet::new(Box::new(session));
     /// yunet.detect(&frame)?;
-    /// assert_eq!(handle.last_inputs().unwrap()[0].shape, vec![1, 3, 240, 320]);
+    /// assert_eq!(handle.last_inputs().unwrap()[0].shape, vec![1, 3, 640, 640]);
     /// ```
+    ///
+    /// A wrapper that wants a *specific* prediction builds its tensors with
+    /// [`FakeSession::new`] instead: `zeros` names its outputs `output0`,
+    /// `output1`, … and a graph's own names (`cls_8`, `bbox_16`, …) are what a
+    /// wrapper looks for. `yunet.rs`'s test module has the builder to copy.
     pub fn handle(&self) -> FakeSessionHandle {
         FakeSessionHandle {
             calls: Arc::clone(&self.calls),
@@ -363,7 +370,7 @@ mod tests {
 
         let input = InputTensor {
             name: "input".to_owned(),
-            shape: vec![1, 3, 240, 320],
+            shape: vec![1, 3, 640, 640],
             data: TensorData::F32(vec![0.5, 0.25]),
         };
         let returned = session.run(std::slice::from_ref(&input)).unwrap();
@@ -451,15 +458,33 @@ mod tests {
             "both names must appear: {unexpected}"
         );
 
+        // The shapes here are a real head's: `bbox_32` is `[1, 400, 4]` for the
+        // shipping model, so `[1, 395, 4]` is the kind of near-miss a wrong
+        // export produces. The assertion is only that both numbers reach the
+        // message, which is what an operator sees when a model file is wrong.
         let shape = ModelError::UnexpectedShape {
-            name: "output1",
-            expected: vec![1, 1580, 15],
-            got: vec![1, 395, 15],
+            name: "bbox_32",
+            expected: vec![1, 400, 4],
+            got: vec![1, 395, 4],
         }
         .to_string();
         assert!(
-            shape.contains("1580") && shape.contains("395"),
+            shape.contains("400") && shape.contains("395"),
             "both shapes must appear: {shape}"
+        );
+
+        // And the data-length variant names the count it actually found, not
+        // just the shape it was promised — those two are the whole diagnosis
+        // when a session hands back a truncated tensor.
+        let short = ModelError::UnexpectedDataLength {
+            name: "cls_8",
+            shape: vec![1, 6400, 1],
+            got: 10,
+        }
+        .to_string();
+        assert!(
+            short.contains("cls_8") && short.contains("6400") && short.contains("10"),
+            "the head, the declared size and the actual size must all appear: {short}"
         );
     }
 }
