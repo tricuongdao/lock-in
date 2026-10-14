@@ -14,9 +14,10 @@
 //! for the real `ort` session in Task 19 changes one `Box<dyn ...>` and no
 //! wrapper code at all.
 //!
-//! Modules are declared here as they land: [`yunet`] and [`facemesh`] now, with
-//! the rest to follow.
+//! Modules are declared here as they land: [`yunet`], [`facemesh`] and
+//! [`eyestate`] now, with the rest to follow.
 
+pub mod eyestate;
 pub mod facemesh;
 pub mod yunet;
 
