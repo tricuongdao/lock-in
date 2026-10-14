@@ -8,6 +8,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
+nalgebra = "0.34"
 ort = "~2.0"
 nokhwa = { version = "0.10", features = ["input-msmf", "decoding"] }
 image = "0.25"
