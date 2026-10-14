@@ -5,10 +5,10 @@
 //! tree is arithmetic over plain data, which is what makes the geometry-heavy
 //! half of the engine testable without a camera or a model file.
 //!
-//! Modules are declared here as they land: [`intrinsics`], [`nms`] and [`pose`]
-//! now, with eye geometry, phone association and primary-face selection to
-//! follow.
+//! Modules are declared here as they land: [`eyes`], [`intrinsics`], [`nms`] and
+//! [`pose`] now, with phone association and primary-face selection to follow.
 
+pub mod eyes;
 pub mod intrinsics;
 pub mod nms;
 pub mod pose;
