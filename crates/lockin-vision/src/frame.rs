@@ -6,7 +6,10 @@ use std::time::Instant;
 /// frames at this resolution, where sub-pixel accuracy is irrelevant.
 const LUMA_WIDTH: usize = 64;
 const LUMA_HEIGHT: usize = 48;
-const LUMA_LEN: usize = LUMA_WIDTH * LUMA_HEIGHT;
+
+/// Length of the luma array [`Frame::luma_64x48`] returns, and so the length
+/// every stage that consumes it is typed against.
+pub const LUMA_LEN: usize = LUMA_WIDTH * LUMA_HEIGHT;
 
 /// Why a [`Frame`] could not be built.
 #[derive(Debug, thiserror::Error)]
