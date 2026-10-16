@@ -95,6 +95,19 @@ const OUTPUT_NAME: &str = "19";
 /// The square size the graph's input is fixed at.
 const INPUT_SIZE: usize = 32;
 
+/// Half of it, as the `f32` the sampler measures tensor coordinates from.
+///
+/// A separate constant rather than a `* 0.5` at the use site so that it is
+/// checked by the compiler: `INPUT_SIZE as f32 * 0.5` and `(INPUT_SIZE / 2) as
+/// f32` happen to agree for 32 and would silently disagree (by a half pixel in
+/// every sample) for any odd size, which is a bug this assertion refuses to
+/// leave for a reader to notice.
+const HALF_INPUT_SIZE: f32 = INPUT_SIZE as f32 * 0.5;
+const _: () = assert!(
+    HALF_INPUT_SIZE as usize * 2 == INPUT_SIZE,
+    "INPUT_SIZE must be even"
+);
+
 /// Channels per pixel: BGR.
 const CHANNELS: usize = 3;
 
@@ -239,7 +252,7 @@ pub fn preprocess(frame: &Frame, eye_box: &Rect, roll_degrees: f32) -> InputTens
     // in a way that is easy to miss: `INPUT_SIZE / 2` alone would be an integer
     // division, and a bare `16.0` would make the whole expression infer as `f64`
     // -- which is not a style point, it is a half-pixel shift in every sample.
-    let half = INPUT_SIZE as f32 * 0.5;
+    let half = HALF_INPUT_SIZE;
 
     for row in 0..INPUT_SIZE {
         let offset_y = (row as f32 + 0.5 - half) * step_y;
@@ -682,6 +695,17 @@ mod tests {
                 );
             }
         }
+        // And which way: at +90 the source x *decreases* as the tensor walks down
+        // its rows. The gradient magnitudes above would pass either way round, and
+        // a rotation that ran backwards hands the graph the same eye mirrored --
+        // which no downstream reader can detect, because a mirrored eye is still a
+        // plausible upright eye. This one assertion is what makes the direction a
+        // fact rather than a convention.
+        let downwards = at(&tensor, 0, 0, 31) - at(&tensor, 0, 0, 0);
+        assert!(
+            downwards > 25.0 / 255.0,
+            "a +90 roll walks the source x upwards as the tensor walks down: {downwards}"
+        );
 
         // A roll of zero is not a rotation, and is asserted here to be exactly the
         // plain resize rather than merely close to it: `classify` is called with
