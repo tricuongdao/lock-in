@@ -8,7 +8,9 @@ edition.workspace = true
 image.workspace = true
 nalgebra.workspace = true
 nokhwa.workspace = true
+serde.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 tempfile = "3"
