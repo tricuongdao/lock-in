@@ -533,11 +533,13 @@ mod tests {
 
     /// The graph's output tensor, named and shaped as the file declares it.
     ///
-    /// Built through the module's own `OUTPUT_NAME`, so a typo in that constant
-    /// fails the tests here rather than being copied into them.
+    /// The name is the **literal** `logits`, not the module's `OUTPUT_NAME`,
+    /// deliberately: a test that built its fake through the constant would agree
+    /// with a wrong constant and pass. `logits` is a fact about the model file —
+    /// `read_graph.py` prints it — and the module's constant has to match it.
     fn logits_output(logit: f32) -> OutputTensor {
         OutputTensor {
-            name: OUTPUT_NAME.to_owned(),
+            name: "logits".to_owned(),
             shape: vec![1, 1],
             data: TensorData::F32(vec![logit]),
         }
@@ -834,7 +836,10 @@ mod tests {
         assert_eq!(calls.len(), 1, "one crop is one run");
         assert_eq!(calls[0].len(), 1, "this graph takes exactly one input");
         let input = &calls[0][0];
-        assert_eq!(input.name, INPUT_NAME, "the graph's own spelling");
+        // `images`, the literal the graph declares, not the module's
+        // `INPUT_NAME`: a session binds by name, so the assertion is about what
+        // is in the model file rather than about what this module calls it.
+        assert_eq!(input.name, "images", "the graph's own spelling");
         assert_eq!(input.shape, vec![1, 3, 256, 256]);
         assert!(
             matches!(input.data, TensorData::F32(_)),
