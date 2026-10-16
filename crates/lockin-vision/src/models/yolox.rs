@@ -1770,6 +1770,73 @@ mod tests {
     }
 
     #[test]
+    fn a_phone_inside_a_person_survives_suppression() {
+        // The signal the whole product is built on, from the `yolox` side. A
+        // phone held up to a face sits *inside* that person's box, so the two
+        // rects are near-identical and the IoU is at its maximum. If suppression
+        // ignored `class_id`, the stronger person box would delete the phone and
+        // the engine would be blind to the one thing it exists to notice.
+        //
+        // `analyze/nms.rs`'s own unit test covers this in isolation; what it
+        // does not cover is that `detect` is the thing calling it. A `detect`
+        // that reached for a class-agnostic sweep — or that passed a `Detection`
+        // whose `class_id` was never set from the row — passes every other test
+        // in this file and fails this one.
+        //
+        // Rows 0 and 1 are the first two stride-8 anchors, at grid (0, 0) and
+        // (1, 0), with raw `xy` of zero so both centres land on their cell
+        // corners; `exp(4) * 8 = 436.7` gives both boxes a 436.7-pixel extent,
+        // far wider than the 8-pixel gap between the centres. The IoU is
+        // therefore well above the 0.45 threshold, and the *only* reason both
+        // survive is that they are different classes.
+        //
+        // The two scores are equal by construction — same objectness 0, same
+        // class logit — so neither sorts above the other and the order cannot
+        // hide one behind the other.
+        const LOGIT: f32 = 2.197_224_6; // sigmoid = 0.9
+        let frame = letterboxed_frame((10, 20, 30));
+        let mut raw = blank_predictions();
+        set_row(
+            &mut raw,
+            0,
+            &row_for(0.0, PERSON_CLASS as usize, LOGIT, [0.0, 0.0, 4.0, 4.0]),
+        );
+        set_row(
+            &mut raw,
+            1,
+            &row_for(0.0, CELL_PHONE_CLASS as usize, LOGIT, [0.0, 0.0, 4.0, 4.0]),
+        );
+
+        let (detector, _) = detector_returning(predictions_output(raw));
+        let detections = detector.detect(&frame).expect("a well-formed output");
+
+        assert_eq!(
+            detections.len(),
+            2,
+            "the phone and the person must both survive: {detections:?}"
+        );
+        let classes: Vec<u32> = detections.iter().map(|det| det.class_id).collect();
+        assert!(
+            classes.contains(&PERSON_CLASS) && classes.contains(&CELL_PHONE_CLASS),
+            "both classes survive, got {classes:?}"
+        );
+        assert_eq!(
+            detections[0].score, detections[1].score,
+            "and neither was suppressed for being weaker — the scores are equal"
+        );
+        // The two boxes really do overlap above the threshold, which is what
+        // makes the assertion above a statement about *class* rather than about
+        // geometry: identical rects would give an IoU of 1.0.
+        let overlap = detections[0].rect.iou(&detections[1].rect);
+        assert!(
+            overlap > NMS_IOU_THRESHOLD,
+            "the fixture must overlap enough that a class-agnostic sweep would \
+             suppress one: IoU {overlap} vs threshold {NMS_IOU_THRESHOLD}"
+        );
+        assert!(overlap > 0.9, "and near-identical, as a phone in a hand is");
+    }
+
+    #[test]
     fn sigmoid_is_total_in_both_tails() {
         // The score is this wrapper's own activation, and the textbook
         // `1 / (1 + exp(-x))` overflows in the *negative* tail: `exp(88.8)` is
