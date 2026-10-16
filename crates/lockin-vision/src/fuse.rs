@@ -17,6 +17,11 @@
 //! `9.1e-4`, which does not. Under D6 the honest answer to "may this tick be
 //! acted on" is no, and a mean would say yes.
 //!
+//! The rule is enforced in one place, [`Confidence`]'s own constructor, and the
+//! **wire path recomputes `overall` from the fields rather than trusting what it
+//! reads** — a JSON record that disagrees with itself must not be able to reopen
+//! the hole this rule closes. See *The wire path reloads a record* below.
+//!
 //! # What each field means, and where its number comes from
 //!
 //! A field is the confidence of the **claim its signal makes this tick**. A
@@ -49,14 +54,17 @@
 //! the product, because the floor is read by the whole state machine and the
 //! missing evidence is read by one branch of it:
 //!
-//! 1. **No face at all.** Zero faces claims nothing about the wearer, and
-//!    `AwayFromDesk` is entered by *counting* zero-face ticks — after the floor
-//!    check, which returns early. A zero here would make the spec's 3 s away
-//!    entry unreachable, so `face` is `1.0` when `faces == 0`. A dark frame the
-//!    detector cannot see into therefore reads as an empty desk, which is the
-//!    honest reading of "no face detected" and the direction D6 accepts: D6
-//!    forbids manufacturing a *distraction* out of weak evidence, and an empty
-//!    desk is not a distraction.
+//! 1. **No face at all.** Zero faces makes no claim about the wearer, so a zero
+//!    here would not be caution — it would be a **false statement**: "the face
+//!    signal is untrustworthy" when there is no face signal at all. An absent
+//!    reading and an illegible one are different facts, and every consumer of
+//!    this record — the state machine, the calibrator, the replay summaries, the
+//!    overlay — needs to tell them apart; a floor failed by a tick with nothing
+//!    in it would be a floor that encodes "no evidence" as "bad evidence". So
+//!    `face` is `1.0` when `faces == 0`, and a dark frame the detector cannot see
+//!    into reads as an empty desk — the honest reading of "no face detected", and
+//!    the direction D6 accepts: D6 forbids manufacturing a *distraction* out of
+//!    weak evidence, and an empty desk is not a distraction.
 //! 2. **No eye crop.** `eye_closed` is `None` when stage 2b had no usable box,
 //!    and the eye field does not depend on stage 2b's answer: it is the dense
 //!    stage's verdict on the landmarks the eye reading is *built from*, so a
@@ -81,6 +89,35 @@
 //! previous state forward, and a tick that a rejected pose left below the floor
 //! is carried forward instead of being read as `OtherPresent` — "a colleague is
 //! in the room" — which is what a `Some` with unknown angles would become.
+//!
+//! **The wire path enforces the same pairing on the way in.** A record is a
+//! record whether it came from this module or from a file, and a JSON file is
+//! not bound by this module's invariants — see the next section.
+//!
+//! # The wire path reloads a record as one this module could have produced
+//!
+//! `Observation` is serialisable so the `probe` overlay and corpus review can
+//! read it, which makes deserialisation a **second entrance** to the record. The
+//! two types that belong to other tasks ([`PhoneSignal`] and [`HeadPose`]) are
+//! adapted field by field; the three record types normalise themselves through a
+//! private mirror and a `TryFrom`, so what comes off the wire is a record `fuse`
+//! could have emitted:
+//!
+//! | what the wire said | what loads |
+//! |---|---|
+//! | `overall` disagreeing with its own fields | `overall` recomputed as their least |
+//! | a confidence outside `0.0..=1.0` | clamped — the nearest probability is the only reading available |
+//! | a confidence that is not a finite number | **refused**: the field has no unrepresentable state, so there is nothing honest to load |
+//! | `primary` whose pose is invalid, not finite, or outside `±90°` of yaw or pitch | `primary: None`, and `face: 0.0` when the record claims faces — this is the pose's own "no reading" state, the one `pose` returns when it cannot state a pose honestly |
+//! | `primary` with `faces == 0` | `primary: None`: a frame with no face cannot carry a face reading, and `face` follows the zero-face rule |
+//! | `faces > 0` with no primary | `face: 0.0`: a detected face whose reading did not survive is no evidence, exactly as on the live path |
+//! | an `ear` that is negative or not finite | **refused**: a ratio of distances cannot be negative, and clamping towards zero would manufacture the drowsiness signal |
+//!
+//! Everything else is carried through unchanged, and **a record this module
+//! produced is a fixed point of the reload** — which is what the round-trip test
+//! asserts, so the normalisation cannot quietly reshape the engine's own output.
+//! The refusals are loud on purpose: a corpus that will not load is a finding,
+//! where a silently repaired confidence is a hole.
 //!
 //! # What this module does not claim
 //!
@@ -136,8 +173,11 @@ const MOST_FACES: u8 = u8::MAX;
 ///
 /// Named rather than written as `1.0` at each site, because the reasoning is the
 /// same at all three and it is not "we are sure of the reading": it is that
-/// there is no reading to be wrong about. See the module docs for the three
-/// cases and for what zero would cost at each.
+/// there is no reading to be wrong about. The field is a statement about a
+/// signal, and an absent signal is not a bad one — reporting it as bad would
+/// conflate "nothing was there to read" with "what was there could not be read",
+/// which are different facts to every consumer of the record. See the module
+/// docs for the three cases.
 const NO_CLAIM: f32 = 1.0;
 
 /// The confidence of a signal whose claim could not be supported at all.
@@ -159,6 +199,7 @@ const NO_EVIDENCE: f32 = 0.0;
 /// fixtures build it by hand — and the constructor is the path the pipeline
 /// takes.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawFaceSignals")]
 pub struct FaceSignals {
     /// Which way the face is pointing, in degrees. `valid` is `true` in every
     /// value this module produces; see [`FaceSignals::from_landmarks`].
@@ -180,7 +221,12 @@ pub struct FaceSignals {
 /// without defending itself against a NaN — and a NaN left in a field would be
 /// *dropped* by a minimum rather than propagated, so the guard is load-bearing
 /// rather than decorative.
+///
+/// Deserialising goes through the same constructor as [`fuse`] does, so a record
+/// read from a file cannot state an `overall` its own fields contradict: see
+/// *The wire path reloads a record* in the module docs.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawConfidence")]
 pub struct Confidence {
     /// The least of the three signal confidences. **Not the mean**: see the
     /// module docs.
@@ -191,6 +237,25 @@ pub struct Confidence {
     pub phone: f32,
     /// The confidence of the eye reading.
     pub eye: f32,
+}
+
+impl Confidence {
+    /// The three signal confidences, with `overall` as their least.
+    ///
+    /// The single construction point for the four numbers, used by [`fuse`] and
+    /// by the wire path, so "`overall` is the minimum of the fields" is a
+    /// property of the type rather than of each builder remembering it. The
+    /// three arguments are taken as read: [`fuse`] builds them from the models
+    /// and sanitises each one, and the wire path clamps its three before calling
+    /// this.
+    fn of(face: f32, phone: f32, eye: f32) -> Confidence {
+        Confidence {
+            overall: face.min(phone).min(eye),
+            face,
+            phone,
+            eye,
+        }
+    }
 }
 
 /// One tick's diagnostic record: what the pipeline saw, and how much of it to
@@ -204,6 +269,7 @@ pub struct Confidence {
 /// `Copy` because the motion gate re-emits the previous observation on a static
 /// scene, and no field of it allocates.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(try_from = "RawObservation")]
 pub struct Observation {
     /// Milliseconds from the engine's own origin, as the caller counted them.
     /// Fusion reads no clock, so this is a carried number and not a measurement
@@ -238,13 +304,16 @@ pub struct StageOutputs<'a> {
     /// [`Observation::tick_ms`] unchanged.
     pub tick_ms: u64,
     /// Stage 1's faces for this frame, in YuNet's order — strongest first. Only
-    /// `len()` and `primary` are read: the signals come from the primary face
-    /// alone, and the count is the frame's, not a per-face summary.
+    /// `len()` and the face `primary` names are read: the signals come from the
+    /// primary face alone, and the count is the frame's, not a per-face summary.
     pub faces: &'a [FaceBox],
-    /// The primary face's box, from [`PrimarySelector::select`](crate::analyze::primary::PrimarySelector::select).
-    /// `None` when there was no face to choose; no other field is read from it
-    /// than its score.
-    pub primary: Option<&'a FaceBox>,
+    /// **An index into `faces`**, as
+    /// [`PrimarySelector::select`](crate::analyze::primary::PrimarySelector::select)
+    /// returns it — not a box of its own, so "no faces but a primary" cannot be
+    /// written down at all. `None` when there was no face to choose; an index
+    /// past the end of the slice names no face, and is treated as `None` rather
+    /// than panicking.
+    pub primary: Option<usize>,
     /// Stage 2's landmarks for the primary face, or `None` when stage 2 did not
     /// run or failed. A detected face with no landmarks is no reading at all.
     pub landmarks: Option<&'a Landmarks>,
@@ -314,16 +383,18 @@ impl FaceSignals {
 pub fn fuse(stages: StageOutputs<'_>) -> Observation {
     let faces = stages.faces.len().min(MOST_FACES as usize) as u8;
 
+    // The primary face comes out of the slice the count came from, and an index
+    // that names nothing is no primary: the record cannot say "no faces" and
+    // "here is the face reading" at once, because there is only one slice.
+    let primary = stages.primary.and_then(|index| stages.faces.get(index));
+
     // Both halves are required for a reading: a face the selector chose, and
     // landmarks the pose solve accepts. A detected face with no landmarks is
     // not a reading either, which is why the two are folded together here
     // rather than checked at the call site.
-    let signals = stages
-        .primary
-        .zip(stages.landmarks)
-        .and_then(|(_, landmarks)| {
-            FaceSignals::from_landmarks(landmarks, stages.intrinsics, stages.eye_closed)
-        });
+    let signals = primary.zip(stages.landmarks).and_then(|(_, landmarks)| {
+        FaceSignals::from_landmarks(landmarks, stages.intrinsics, stages.eye_closed)
+    });
 
     // The landmarks the *eye* confidence rests on: the same ones, and only when
     // they became a reading. A rejected pose and absent landmarks are one fact
@@ -335,7 +406,7 @@ pub fn fuse(stages: StageOutputs<'_>) -> Observation {
         None
     };
 
-    let face = face_confidence(faces, stages.primary, signals.is_some());
+    let face = face_confidence(faces, primary, signals.is_some());
     let phone = phone_confidence(stages.phone, stages.phones);
     let eye = eye_confidence(eye_landmarks);
 
@@ -345,14 +416,9 @@ pub fn fuse(stages: StageOutputs<'_>) -> Observation {
         primary: signals,
         phone: stages.phone,
         motion: stages.motion,
-        confidence: Confidence {
-            // The least, not the mean: one untrustworthy signal must not be
-            // averaged away by two healthy ones. See the module docs.
-            overall: face.min(phone).min(eye),
-            face,
-            phone,
-            eye,
-        },
+        // One construction point for the four numbers, so `overall` is the
+        // least of the three fields here and on the wire alike.
+        confidence: Confidence::of(face, phone, eye),
     }
 }
 
@@ -361,14 +427,21 @@ pub fn fuse(stages: StageOutputs<'_>) -> Observation {
 /// Three cases, and the order they are tested in *is* the rule:
 ///
 /// 1. **No faces at all** — nothing is claimed about the wearer, so nothing is
-///    distrusted, and the tick stays above the floor so that the away dwell can
-///    accrue. See the module docs.
+///    distrusted: an absent reading is not an illegible one, and the field says
+///    which of the two happened. See the module docs.
 /// 2. **A face and no reading** — the detector saw a face and the landmark
 ///    stage could not turn it into signals: a pose the solve refused, or a
 ///    stage 2 that did not run. That is no evidence, and it is what keeps a
 ///    rejected pose from being read downstream as a frame full of usable
 ///    signals.
 /// 3. **A face and a reading** — the primary box's own score, sanitised.
+///
+/// The zero-face case is **conditional on the phone field**: a zero-face tick
+/// whose phone verdict claims use while the caller hands no phone box to back it
+/// (a `StageOutputs::phones` contract violation) reads `phone == 0.0`, and
+/// `overall` is then zero with it. That is the caller's error being punished,
+/// not the face field contradicting itself — see
+/// `a_carried_phone_claim_without_its_boxes_falls_below_the_floor`.
 fn face_confidence(faces: u8, primary: Option<&FaceBox>, readable: bool) -> f32 {
     if faces == 0 {
         return NO_CLAIM;
@@ -461,6 +534,152 @@ fn logistic(logit: f32) -> f32 {
     }
 }
 
+/// One face's signals as they arrive on the wire, before normalisation.
+///
+/// The wire shape of [`FaceSignals`], field for field, so the format a reader
+/// sees is the format the type declares. `head` goes through the same
+/// [`head_pose`] adapter on the way in, which is where an unusable pose becomes
+/// [`HeadPose::INVALID`]; this mirror adds the one guard the type cannot express
+/// on its own — see [`TryFrom`] below.
+#[derive(Deserialize)]
+struct RawFaceSignals {
+    #[serde(with = "head_pose")]
+    head: HeadPose,
+    ear: f32,
+    eye_closed: Option<bool>,
+}
+
+impl TryFrom<RawFaceSignals> for FaceSignals {
+    type Error = &'static str;
+
+    /// An eye ratio is carried, or the record is refused.
+    ///
+    /// [`ear`](crate::analyze::eyes::ear) is documented as *always finite and
+    /// never negative*: it is a ratio of two distances. A negative value is not
+    /// a measurement, and the one thing that must not happen to it is a clamp —
+    /// clamping towards zero would turn corrupt data into the **strongest**
+    /// drowsiness signal there is, which is the direction D6 forbids
+    /// manufacturing. There is no "unusable eye ratio" state for the type to
+    /// fall back on, so the record is refused instead, loudly.
+    fn try_from(raw: RawFaceSignals) -> Result<FaceSignals, Self::Error> {
+        if !raw.ear.is_finite() || raw.ear < 0.0 {
+            return Err("an eye aspect ratio that is not a finite, non-negative measurement");
+        }
+        Ok(FaceSignals {
+            head: raw.head,
+            ear: raw.ear,
+            eye_closed: raw.eye_closed,
+        })
+    }
+}
+
+/// A tick's record as it arrives on the wire, before normalisation.
+///
+/// The wire shape of [`Observation`], field for field. The confidence arrives
+/// through [`Confidence`]'s own deserialisation, so it is already inside
+/// `0.0..=1.0` with a recomputed `overall` by the time this struct exists; what
+/// is left for [`TryFrom`] is the pairing between the primary face and the face
+/// confidence.
+#[derive(Deserialize)]
+struct RawObservation {
+    tick_ms: u64,
+    faces: u8,
+    primary: Option<FaceSignals>,
+    #[serde(with = "phone_signal")]
+    phone: PhoneSignal,
+    motion: f32,
+    confidence: Confidence,
+}
+
+impl TryFrom<RawObservation> for Observation {
+    type Error = &'static str;
+
+    /// The record is reloaded as the shape [`fuse`] produces.
+    ///
+    /// Three things are decided here, and each is the live path's own rule
+    /// applied to a record that did not come from it:
+    ///
+    /// 1. **A primary face needs faces.** A frame with none cannot carry a face
+    ///    reading, and a reading that did not survive — a pose the type cannot
+    ///    state, which the adapter turns into [`HeadPose::INVALID`] — is no
+    ///    reading at all. Either way `primary` becomes `None`.
+    /// 2. **The face confidence follows the same three cases as
+    ///    `face_confidence`**: no faces is a claim of nothing (`1.0`, and the
+    ///    wire's own number is not information there), a face with no reading is
+    ///    no evidence (`0.0`), and a face with a reading keeps the score the
+    ///    record carries.
+    /// 3. **`overall` is recomputed** by [`Confidence::of`] after step 2, so a
+    ///    record whose face field changed cannot keep an `overall` that
+    ///    disagrees with it.
+    ///
+    /// Nothing else is touched, and a record this crate produced is unchanged by
+    /// the trip — every branch above reproduces what `fuse` wrote.
+    fn try_from(raw: RawObservation) -> Result<Observation, Self::Error> {
+        let signals = raw.primary.filter(|signals| signals.head.valid);
+        let primary = if raw.faces == 0 { None } else { signals };
+        let face = match (raw.faces, primary) {
+            (0, _) => NO_CLAIM,
+            (_, Some(_)) => raw.confidence.face,
+            (_, None) => NO_EVIDENCE,
+        };
+
+        Ok(Observation {
+            tick_ms: raw.tick_ms,
+            faces: raw.faces,
+            primary,
+            phone: raw.phone,
+            motion: raw.motion,
+            confidence: Confidence::of(face, raw.confidence.phone, raw.confidence.eye),
+        })
+    }
+}
+
+/// A tick's confidence as it arrives on the wire, before normalisation.
+///
+/// The wire shape of [`Confidence`], field for field. `overall` is read, checked
+/// and then **discarded**: it is derived from the other three, and a file that
+/// states one its own fields contradict is exactly the hole the minimum rule
+/// exists to close. It must still *be a number*, because a record carrying a
+/// value that cannot be a confidence is a record that does not know what it is;
+/// what it may not do is disagree with the three fields it is derived from.
+#[derive(Deserialize)]
+struct RawConfidence {
+    #[allow(dead_code)]
+    overall: f32,
+    face: f32,
+    phone: f32,
+    eye: f32,
+}
+
+impl TryFrom<RawConfidence> for Confidence {
+    type Error = &'static str;
+
+    /// The three fields clamped into a probability, and `overall` recomputed.
+    ///
+    /// A *finite* value outside `0.0..=1.0` is clamped: the nearest probability
+    /// is the only reading available, and it is the same repair the live path
+    /// applies to a model score. A value that is **not finite** is refused,
+    /// `overall` included — a confidence has no unrepresentable state to fall
+    /// back on, and the alternative would be to invent one of the four numbers
+    /// (the `overall` a floor is compared against, at that). No JSON number
+    /// reaches here as a non-finite `f32` — `serde_json` refuses a literal that
+    /// overflows — so the guard is tested on the conversion itself.
+    fn try_from(raw: RawConfidence) -> Result<Confidence, Self::Error> {
+        if !raw.overall.is_finite()
+            || !raw.face.is_finite()
+            || !raw.phone.is_finite()
+            || !raw.eye.is_finite()
+        {
+            return Err("a confidence that is not a finite number");
+        }
+        Ok(Confidence::of(
+            raw.face.clamp(0.0, 1.0),
+            raw.phone.clamp(0.0, 1.0),
+            raw.eye.clamp(0.0, 1.0),
+        ))
+    }
+}
+
 /// [`PhoneSignal`] on the wire, by name.
 ///
 /// Task 12's type is in another task's file and carries no serde derives, so the
@@ -517,11 +736,17 @@ mod phone_signal {
 /// rather than dropping it, because a `FaceSignals` is a public record and a
 /// caller can build one by hand.
 ///
-/// **Deserialising restores `pose`'s invariant**: an invalid pose comes back as
-/// [`HeadPose::INVALID`] whatever angles the input carried. `INVALID` is the
-/// only shape in which an invalid pose exists — `valid == false` with a zeroed
-/// `Euler` — so a record that satisfied the flag but not the shape would hand a
-/// consumer that reads the angles before the flag a pose that was never solved.
+/// **Deserialising restores `pose`'s invariants in both directions**: an invalid
+/// pose comes back as [`HeadPose::INVALID`] whatever angles the input carried,
+/// and so does a pose the angles cannot honestly describe — a `yaw` or `pitch`
+/// outside `±90°`, or an angle that is not finite. `INVALID` is the only shape
+/// in which an invalid pose exists, `valid == false` beside a zeroed `Euler`, so
+/// a record that satisfied the flag but not the shape would hand a consumer that
+/// reads the angles before the flag a pose that was never solved; and a `valid:
+/// true` record carrying `yaw: 120` is a pose `pose` never returns, which is the
+/// same problem from the other side. Refusing the *pose* rather than the record
+/// is deliberate: an unusable pose is a state this crate has a value for, and
+/// [`Observation`]'s own reload turns it into `primary: None`.
 mod head_pose {
     use crate::analyze::pose::{Euler, HeadPose};
     use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -547,7 +772,16 @@ mod head_pose {
 
     pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<HeadPose, D::Error> {
         let angles = Angles::deserialize(deserializer)?;
-        if !angles.valid {
+        // `roll` is unbounded by design — a head tipped past its side is a real
+        // pose — so only the two angles `pose` promises to keep inside ±90° are
+        // checked, and every angle must be finite to be an angle at all.
+        if !angles.valid
+            || !angles.yaw.is_finite()
+            || !angles.pitch.is_finite()
+            || !angles.roll.is_finite()
+            || angles.yaw.abs() > 90.0
+            || angles.pitch.abs() > 90.0
+        {
             return Ok(HeadPose::INVALID);
         }
         Ok(HeadPose {
@@ -565,6 +799,7 @@ mod head_pose {
 mod tests {
     use super::*;
     use crate::analyze::nms::Rect;
+    use crate::analyze::pose::Euler;
     use crate::models::yolox::{CELL_PHONE_CLASS, PERSON_CLASS};
 
     /// The intrinsics Task 7 estimates for the reference 640x480 frame, as
@@ -702,6 +937,35 @@ mod tests {
         }
     }
 
+    /// [`frontal`], rolled about the principal point by `degrees`.
+    ///
+    /// A roll about the camera's optical axis is exactly a rotation of the image
+    /// about the principal point when `fx == fy` and that point is [`k`]'s, so
+    /// this is the constellation a face rolled by that much projects — with
+    /// `z` untouched, because a roll does not change depth. Every distance the
+    /// pose and the eye ratio read is a distance in the image, so the fixture
+    /// stays a face the solve accepts.
+    ///
+    /// It exists for the round-trip test, whose angles must be **non-zero** for
+    /// "the angles survive the wire" to mean anything: the frontal fixture's
+    /// Euler is within a degree of zero on all three axes, where an angle
+    /// dropped in serialisation would round-trip unnoticed.
+    fn rolled(degrees: f32, score: f32) -> Landmarks {
+        let mut landmarks = frontal(score);
+        let (sin, cos) = degrees.to_radians().sin_cos();
+        // Only the eighteen placed points move: the rest sit at the origin,
+        // which is the fixture's way of saying that nothing reads them.
+        for point in landmarks.points.iter_mut() {
+            if *point == [0, 0, 0] {
+                continue;
+            }
+            let (dx, dy) = ((point[0] - 320) as f32, (point[1] - 240) as f32);
+            point[0] = (320.0 + dx * cos - dy * sin).round() as i32;
+            point[1] = (240.0 + dx * sin + dy * cos).round() as i32;
+        }
+        landmarks
+    }
+
     #[test]
     fn confidence_is_the_minimum_of_the_signal_confidences() {
         // Three ticks, each with a *different* signal as the weakest, so the
@@ -729,7 +993,7 @@ mod tests {
             let obs = fuse(StageOutputs {
                 tick_ms: 1_000,
                 faces: &faces,
-                primary: Some(&faces[0]),
+                primary: Some(0),
                 landmarks: Some(&landmarks),
                 eye_closed: Some(false),
                 intrinsics: &k(),
@@ -769,7 +1033,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 200,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&refused),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -797,7 +1061,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 200,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: None,
             eye_closed: None,
             intrinsics: &k(),
@@ -819,7 +1083,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 200,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&marginal),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -846,7 +1110,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 200,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&good),
             eye_closed: Some(true),
             intrinsics: &k(),
@@ -883,7 +1147,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 400,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: None,
             intrinsics: &k(),
@@ -914,12 +1178,12 @@ mod tests {
     }
 
     #[test]
-    fn a_frame_with_no_faces_is_trusted_enough_to_reach_away_from_desk() {
-        // Task 16's carry-forward rule runs *before* its zero-face rule, so a
-        // tick with no faces and no confidence would never accrue the 3 s that
-        // `AwayFromDesk` needs — the spec's own state would be unreachable and
-        // an empty desk would read as `Focused` for ever. Zero faces claims
-        // nothing about the wearer, so nothing here is distrusted.
+    fn a_frame_with_no_faces_claims_nothing_so_nothing_is_distrusted() {
+        // Zero faces makes no claim about the wearer, so a zero here would be a
+        // false statement rather than caution: "the face signal is
+        // untrustworthy" when there is no face signal. An absent reading and an
+        // illegible one are different facts, and this field reports the one that
+        // is true — **given no phone claim**, which is the next test's subject.
         let obs = fuse(StageOutputs {
             tick_ms: 600,
             faces: &[],
@@ -948,6 +1212,46 @@ mod tests {
     }
 
     #[test]
+    fn a_carried_phone_claim_without_its_boxes_falls_below_the_floor() {
+        // The conditional half of the rule above, and the reason the module docs
+        // say "given no phone claim". Stage 3 runs at 1–2 Hz, so a caller
+        // carries the last verdict forward — and `StageOutputs::phones` is
+        // documented as *the boxes that verdict came from*, exactly so that a
+        // claim of use keeps the confidence behind it. A caller that carries
+        // `InHand` and hands an empty slice gets `phone == 0.0`: a claim of use
+        // with no phone box behind it is not evidence, and the tick is carried
+        // forward rather than acted on. That is the documented contract being
+        // enforced, not the zero-face rule contradicting itself — and it is why
+        // the face field's `1.0` cannot be read as "this tick is usable".
+        let obs = fuse(StageOutputs {
+            tick_ms: 700,
+            faces: &[],
+            primary: None,
+            landmarks: None,
+            eye_closed: None,
+            intrinsics: &k(),
+            phones: &[],
+            phone: PhoneSignal::InHand,
+            motion: 0.0,
+        });
+
+        assert_eq!(obs.faces, 0, "still nobody at the desk");
+        assert_eq!(
+            obs.confidence.face, 1.0,
+            "and still nothing claimed about a face"
+        );
+        assert_eq!(
+            obs.confidence.phone, 0.0,
+            "but an unbacked claim of use is no evidence"
+        );
+        assert_eq!(obs.confidence.overall, 0.0);
+        assert!(
+            obs.confidence.overall < 0.6,
+            "so the tick falls below Task 16's floor and is carried forward"
+        );
+    }
+
+    #[test]
     fn the_face_confidence_is_the_primarys_own_score() {
         // Three faces, and the primary is the middle one: 0.71, which is neither
         // the detector's best box (0.95), nor the first in the slice, nor a
@@ -959,7 +1263,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 800,
             faces: &faces,
-            primary: Some(&faces[1]),
+            primary: Some(1),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -971,6 +1275,53 @@ mod tests {
         assert_eq!(obs.faces, 3, "the count is reported as it is");
         assert_eq!(obs.confidence.face, 0.71, "the primary's own score");
         assert_eq!(obs.confidence.overall, 0.71);
+    }
+
+    #[test]
+    fn an_index_that_names_no_face_is_no_primary() {
+        // `primary` is an index into `faces`, which is what
+        // `PrimarySelector::select` returns — so "no faces but a primary face"
+        // cannot be written down, and an index past the end of the slice names
+        // no face rather than panicking. This is the shape the previous
+        // interface allowed: a slice and a box that could disagree.
+        let obs = fuse(StageOutputs {
+            tick_ms: 900,
+            faces: &[],
+            primary: Some(0),
+            landmarks: None,
+            eye_closed: None,
+            intrinsics: &k(),
+            phones: &[],
+            phone: PhoneSignal::None,
+            motion: 0.0,
+        });
+        assert_eq!(obs.faces, 0, "the slice is the frame, and it is empty");
+        assert_eq!(obs.primary, None);
+        assert_eq!(
+            obs.confidence.face, 1.0,
+            "and the zero-face rule applies: nothing is claimed"
+        );
+
+        // An index past the end of a frame that *does* hold faces is no reading
+        // either, and it is not silence: a face was detected and none of its
+        // signals arrived.
+        let faces = [face(0.9), face(0.7)];
+        let landmarks = frontal(17.0);
+        let obs = fuse(StageOutputs {
+            tick_ms: 900,
+            faces: &faces,
+            primary: Some(7),
+            landmarks: Some(&landmarks),
+            eye_closed: Some(false),
+            intrinsics: &k(),
+            phones: &[],
+            phone: PhoneSignal::None,
+            motion: 0.0,
+        });
+        assert_eq!(obs.faces, 2);
+        assert_eq!(obs.primary, None);
+        assert_eq!(obs.confidence.face, 0.0);
+        assert_eq!(obs.confidence.overall, 0.0);
     }
 
     #[test]
@@ -986,7 +1337,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 1_000,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1006,7 +1357,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 1_000,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1022,15 +1373,15 @@ mod tests {
         // cannot manufacture a state, so suppressing the tick for it would only
         // lose `Focused` time — on every frame, for as long as the object sits
         // on the desk.
-        let unsured = [phone_box(0.31)];
+        let unsure = [phone_box(0.31)];
         let obs = fuse(StageOutputs {
             tick_ms: 1_000,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
-            phones: &unsured,
+            phones: &unsure,
             phone: PhoneSignal::Present,
             motion: 1.0,
         });
@@ -1043,7 +1394,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 1_000,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1063,7 +1414,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 1_000,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1093,7 +1444,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 2_000,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1119,7 +1470,7 @@ mod tests {
         let unconfirmed = fuse(StageOutputs {
             tick_ms: 40,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: None,
             intrinsics: &k(),
@@ -1141,7 +1492,7 @@ mod tests {
         let confirmed = fuse(StageOutputs {
             tick_ms: 40,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(true),
             intrinsics: &k(),
@@ -1167,7 +1518,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 1,
             faces: &many,
-            primary: Some(&many[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1185,7 +1536,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 1,
             faces: &not_a_number,
-            primary: Some(&not_a_number[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1203,7 +1554,7 @@ mod tests {
         let obs = fuse(StageOutputs {
             tick_ms: 1,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1227,7 +1578,7 @@ mod tests {
         let cold = fuse(StageOutputs {
             tick_ms: 4_294_967_295,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1241,7 +1592,7 @@ mod tests {
         let moving = fuse(StageOutputs {
             tick_ms: 12_345,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(false),
             intrinsics: &k(),
@@ -1257,13 +1608,17 @@ mod tests {
     fn observation_is_serialisable_and_round_trips() {
         // Every field carries a value a default or a dropped field would change,
         // and the comparison is the whole record rather than a field at a time.
+        // The face is **rolled**, not frontal: a frontal fixture's Euler is
+        // within a degree of zero on every axis, where an angle dropped in
+        // serialisation would round-trip unnoticed — which is exactly the hole
+        // this test is supposed to cover.
         let faces = [face(0.81)];
-        let landmarks = frontal(12.5);
+        let landmarks = rolled(30.0, 12.5);
         let phones = [phone_box(0.74)];
         let obs = fuse(StageOutputs {
             tick_ms: 12_345,
             faces: &faces,
-            primary: Some(&faces[0]),
+            primary: Some(0),
             landmarks: Some(&landmarks),
             eye_closed: Some(true),
             intrinsics: &k(),
@@ -1271,9 +1626,24 @@ mod tests {
             phone: PhoneSignal::InHand,
             motion: 7.5,
         });
+
+        // The premise: the fixture really does carry a non-zero angle, so the
+        // round trip below is evidence about the angles.
+        let head = obs.primary.expect("the pose solved").head;
+        assert!(
+            head.valid && head.euler.roll.abs() > 25.0,
+            "a 30 degree roll should solve to about 30 degrees of roll, got {:?}",
+            head.euler
+        );
+
         let json = serde_json::to_string(&obs).expect("an Observation serialises");
         let back: Observation = serde_json::from_str(&json).expect("and deserialises");
         assert_eq!(back, obs, "the record survives a round trip: {json}");
+        assert_eq!(
+            back.primary.expect("still a reading").head.euler.roll,
+            head.euler.roll,
+            "and the roll in particular, digit for digit"
+        );
 
         // The four phone verdicts stay distinguishable on the wire: a mapping
         // that collapsed two of them onto one name would round-trip each of them
@@ -1304,34 +1674,308 @@ mod tests {
         }
     }
 
+    /// The record from [`observation_is_serialisable_and_round_trips`]'s shape,
+    /// with the JSON written out by hand so a test can corrupt one field.
+    ///
+    /// `fields` replaces the `confidence` object verbatim, and `primary` the
+    /// primary object; the rest is a well-formed record.
+    fn record_json(primary: &str, confidence: &str) -> String {
+        format!(
+            r#"{{
+                "tick_ms": 1,
+                "faces": 1,
+                "primary": {primary},
+                "phone": "none",
+                "motion": 0.0,
+                "confidence": {confidence}
+            }}"#
+        )
+    }
+
+    /// A `valid` pose at `yaw`, as it would appear in a record.
+    fn pose_json(yaw: f32, valid: bool) -> String {
+        format!(
+            r#"{{"head": {{"yaw": {yaw}, "pitch": -12.0, "roll": 4.0, "valid": {valid}}},
+                "ear": 0.21, "eye_closed": null}}"#
+        )
+    }
+
     #[test]
-    fn a_record_whose_pose_is_not_valid_carries_no_angles() {
+    fn a_record_whose_pose_is_not_valid_loads_as_no_reading() {
         // `HeadPose::INVALID` is the only shape in which `pose` returns an
         // invalid pose — a zeroed `Euler` beside `valid: false` — and a record
         // read back from a corpus has to satisfy the same invariant, or code
         // that reads the angles before the flag sees a pose that was never
-        // solved. The JSON is written out rather than produced by the type, so
-        // this pins the wire format as well: a renamed field or a phone verdict
-        // spelled as a number fails here.
-        let json = r#"{
-            "tick_ms": 1,
-            "faces": 1,
-            "primary": {
-                "head": {"yaw": 31.0, "pitch": -12.0, "roll": 4.0, "valid": false},
-                "ear": 0.21,
-                "eye_closed": null
-            },
-            "phone": "none",
-            "motion": 0.0,
-            "confidence": {"overall": 1.0, "face": 1.0, "phone": 1.0, "eye": 1.0}
-        }"#;
-        let obs: Observation = serde_json::from_str(json).expect("a well-formed record");
-        let signals = obs.primary.expect("the record has a primary");
-        assert_eq!(
-            signals.head,
-            HeadPose::INVALID,
-            "an invalid pose is the zeroed one, whatever the JSON carried"
+        // solved. The hand-written JSON pins the wire format as well: a renamed
+        // field or a phone verdict spelled as a number fails here.
+        //
+        // The fixture is deliberately the **hostile** one: `valid: false` beside
+        // angles that look like a real pose, and a confidence of `1.0` beside it.
+        // Loading it as `primary: Some(zeroed pose)` at confidence `1.0` — which
+        // is what a field-level adapter alone would do — is a record that says
+        // "no reading" and "a perfect reading" at once, and Task 16 reads both
+        // of those fields. So the record is reloaded as the shape `fuse`
+        // produces: no reading, no face confidence, and an `overall` recomputed
+        // from what is left.
+        let json = record_json(
+            &pose_json(31.0, false),
+            r#"{"overall": 1.0, "face": 1.0, "phone": 1.0, "eye": 1.0}"#,
         );
-        assert_eq!(signals.ear, 0.21, "and the rest of the record is kept");
+        let obs: Observation = serde_json::from_str(&json).expect("a well-formed record");
+
+        assert_eq!(obs.faces, 1, "the record claims a face");
+        assert_eq!(
+            obs.primary, None,
+            "and an invalid pose is no reading, whatever angles sat beside it"
+        );
+        assert_eq!(
+            obs.confidence.face, 0.0,
+            "so the face field cannot claim the reading was perfect"
+        );
+        assert_eq!(obs.confidence.overall, 0.0, "and the least of the three");
+        assert!(
+            obs.confidence.overall < 0.6,
+            "below Task 16's floor: the record is carried forward, not acted on"
+        );
+    }
+
+    #[test]
+    fn a_pose_the_crate_cannot_state_loads_as_no_reading() {
+        // The other way a record can carry a pose no solve produces: `valid:
+        // true` beside a `yaw` outside the ±90° `pose` promises. Nothing may
+        // clamp it into range — a clamped angle is a fabricated pose — and
+        // nothing may keep it — a consumer that reads the angles before the flag
+        // would see a head turned 120°. It loads as the pose's own "no reading"
+        // state instead, which the record turns into `primary: None`.
+        let json = record_json(
+            &pose_json(120.0, true),
+            r#"{"overall": 1.0, "face": 1.0, "phone": 1.0, "eye": 1.0}"#,
+        );
+        let obs: Observation = serde_json::from_str(&json).expect("a well-formed record");
+
+        assert_eq!(obs.primary, None, "a yaw of 120 is not a pose");
+        assert_eq!(obs.confidence.face, 0.0);
+        assert_eq!(obs.confidence.overall, 0.0);
+
+        // The boundary the promise is written on: ±90 is inside it, and it is
+        // not clamped or refused.
+        let json = record_json(
+            &pose_json(90.0, true),
+            r#"{"overall": 1.0, "face": 1.0, "phone": 1.0, "eye": 1.0}"#,
+        );
+        let obs: Observation = serde_json::from_str(&json).expect("a well-formed record");
+        let head = obs.primary.expect("90 degrees is a pose").head;
+        assert_eq!(head.euler.yaw, 90.0, "the bound is inclusive");
+    }
+
+    #[test]
+    fn a_record_whose_overall_disagrees_with_its_fields_is_recomputed() {
+        // `overall` is the field a floor is compared against, so a record that
+        // states one its own three fields contradict is the mean-vs-minimum hole
+        // reopened on the wire. The wire's number is read and thrown away: the
+        // fields are the record, and the minimum is what they say.
+        let json = record_json(
+            &pose_json(0.0, true),
+            r#"{"overall": 5.0, "face": 0.81, "phone": 0.45, "eye": 0.93}"#,
+        );
+        let obs: Observation = serde_json::from_str(&json).expect("a well-formed record");
+        assert_eq!(obs.confidence.face, 0.81);
+        assert_eq!(obs.confidence.phone, 0.45);
+        assert_eq!(obs.confidence.eye, 0.93);
+        assert_eq!(
+            obs.confidence.overall, 0.45,
+            "the least of the three, not the 5.0 the file claimed"
+        );
+
+        // And in the other direction: an `overall` *below* its fields is raised
+        // to the minimum rather than believed, because the fields are what the
+        // models said. A record is a report of three measurements, not four.
+        let json = record_json(
+            &pose_json(0.0, true),
+            r#"{"overall": 0.01, "face": 0.81, "phone": 0.45, "eye": 0.93}"#,
+        );
+        let obs: Observation = serde_json::from_str(&json).expect("a well-formed record");
+        assert_eq!(obs.confidence.overall, 0.45);
+    }
+
+    #[test]
+    fn a_confidence_outside_the_unit_range_is_clamped() {
+        // A probability outside `0.0..=1.0` is not a probability, and the
+        // nearest one is the only reading available — the same repair the live
+        // path applies to a model score. An `overall` above every field could
+        // otherwise lift a tick over the floor on its own.
+        let json = record_json(
+            &pose_json(0.0, true),
+            r#"{"overall": 9.0, "face": 1.5, "phone": -0.25, "eye": 0.62}"#,
+        );
+        let obs: Observation = serde_json::from_str(&json).expect("a well-formed record");
+        assert_eq!(obs.confidence.face, 1.0, "clamped down");
+        assert_eq!(obs.confidence.phone, 0.0, "and up");
+        assert_eq!(obs.confidence.eye, 0.62, "untouched in between");
+        assert_eq!(obs.confidence.overall, 0.0);
+    }
+
+    #[test]
+    fn a_confidence_that_is_not_a_number_is_refused() {
+        // The conversion itself, because no JSON number reaches it as a
+        // non-finite `f32` — `serde_json` refuses a literal that overflows — and
+        // a guard that cannot fire through the format is still a guard the next
+        // format will need. A confidence has no "unrepresentable" state to fall
+        // back on: the alternative to refusing is inventing one of the four
+        // numbers, and `overall` is what a floor is compared against.
+        for not_a_number in [f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+            for field in 0..4 {
+                let mut raw = RawConfidence {
+                    overall: 0.9,
+                    face: 0.8,
+                    phone: 0.7,
+                    eye: 0.6,
+                };
+                match field {
+                    0 => raw.overall = not_a_number,
+                    1 => raw.face = not_a_number,
+                    2 => raw.phone = not_a_number,
+                    _ => raw.eye = not_a_number,
+                }
+                assert!(
+                    Confidence::try_from(raw).is_err(),
+                    "a {not_a_number} in field {field} must be refused, not repaired"
+                );
+            }
+        }
+
+        // And the finite case is repaired rather than refused, so the guard is
+        // not simply rejecting everything.
+        let repaired = Confidence::try_from(RawConfidence {
+            overall: 1.0,
+            face: 1.5,
+            phone: 0.25,
+            eye: f32::NAN,
+        });
+        assert!(repaired.is_err(), "the NaN is still refused");
+        let repaired = Confidence::try_from(RawConfidence {
+            overall: 1.0,
+            face: 1.5,
+            phone: 0.25,
+            eye: 0.5,
+        })
+        .expect("finite values load");
+        assert_eq!(
+            repaired,
+            Confidence {
+                overall: 0.25,
+                face: 1.0,
+                phone: 0.25,
+                eye: 0.5,
+            }
+        );
+    }
+
+    #[test]
+    fn a_negative_eye_ratio_is_refused_rather_than_clamped() {
+        // `ear` is a ratio of two distances: it cannot be negative, and there is
+        // no "unusable ratio" state for the type to fall back on. Clamping
+        // towards zero would be the worst possible repair — zero is *closed
+        // eyes*, so corrupt data would become the strongest drowsiness signal
+        // there is — so the record is refused instead.
+        let json = record_json(
+            r#"{"head": {"yaw": 0.0, "pitch": 0.0, "roll": 0.0, "valid": true},
+             "ear": -1.0, "eye_closed": null}"#,
+            r#"{"overall": 1.0, "face": 1.0, "phone": 1.0, "eye": 1.0}"#,
+        );
+        let loaded = serde_json::from_str::<Observation>(&json);
+        assert!(
+            loaded.is_err(),
+            "a negative eye ratio is not a measurement: {loaded:?}"
+        );
+
+        // Zero itself is a measurement — shut eyelids measure exactly that — so
+        // it loads, and it is the value that makes the refusal above matter.
+        let json = record_json(
+            r#"{"head": {"yaw": 0.0, "pitch": 0.0, "roll": 0.0, "valid": true},
+             "ear": 0.0, "eye_closed": true}"#,
+            r#"{"overall": 1.0, "face": 1.0, "phone": 1.0, "eye": 1.0}"#,
+        );
+        let obs: Observation = serde_json::from_str(&json).expect("shut eyes are a reading");
+        let signals = obs.primary.expect("with a reading");
+        assert_eq!(signals.ear, 0.0);
+        assert_eq!(signals.eye_closed, Some(true));
+    }
+
+    #[test]
+    fn a_hand_written_face_reading_round_trips_its_angles_and_validity() {
+        // `FaceSignals` is a public record, so a caller can build one by hand —
+        // with any angles, and with an invalid pose in it. `fuse` never writes
+        // an invalid one, but the wire has to carry the flag honestly in both
+        // directions rather than writing `true` over whatever it is given.
+        let invalid = FaceSignals {
+            head: HeadPose::INVALID,
+            ear: 0.21,
+            eye_closed: None,
+        };
+        let json = serde_json::to_string(&invalid).expect("a FaceSignals serialises");
+        assert!(
+            json.contains("\"valid\":false"),
+            "an invalid pose is written as one: {json}"
+        );
+        let back: FaceSignals = serde_json::from_str(&json).expect("and reads back");
+        assert_eq!(back, invalid);
+
+        // And every angle survives, not just the one the solved fixture happens
+        // to move: the roll-only fixture above leaves `yaw` and `pitch` within a
+        // degree of zero, where a dropped angle would round-trip unnoticed. The
+        // values are chosen to be unmistakable — three different non-zero
+        // numbers — so a swap between two of them fails as well as a loss.
+        let turned = FaceSignals {
+            head: HeadPose {
+                euler: Euler {
+                    yaw: 31.0,
+                    pitch: -12.0,
+                    roll: 4.0,
+                },
+                valid: true,
+            },
+            ear: 0.27,
+            eye_closed: Some(false),
+        };
+        let json = serde_json::to_string(&turned).expect("a FaceSignals serialises");
+        let back: FaceSignals = serde_json::from_str(&json).expect("and reads back");
+        assert_eq!(back, turned, "the angles survive digit for digit: {json}");
+    }
+
+    #[test]
+    fn a_reading_in_a_record_with_no_faces_is_dropped() {
+        // The third way the pairing can be wrong: a record that claims a good
+        // reading from a frame the detector found nobody in. `fuse` cannot write
+        // it — the count and the face come from one slice — so a file that
+        // contains it is reloaded without the reading, and the zero-face rule
+        // takes the face field with it. The confidence is left at the least of
+        // what remains, which is the phone field here.
+        let json = format!(
+            r#"{{
+                "tick_ms": 1,
+                "faces": 0,
+                "primary": {},
+                "phone": "none",
+                "motion": 0.0,
+                "confidence": {{"overall": 0.2, "face": 0.7, "phone": 1.0, "eye": 0.9}}
+            }}"#,
+            pose_json(0.0, true)
+        );
+        let obs: Observation = serde_json::from_str(&json).expect("a well-formed record");
+
+        assert_eq!(obs.faces, 0);
+        assert_eq!(
+            obs.primary, None,
+            "a frame with no face cannot carry a face reading"
+        );
+        assert_eq!(
+            obs.confidence.face, 1.0,
+            "and the zero-face rule takes the field: nothing was claimed"
+        );
+        assert_eq!(
+            obs.confidence.overall, 0.9,
+            "so the least of what is left is the eye field"
+        );
     }
 }
