@@ -685,16 +685,20 @@ mod tests {
         Landmarks { points, score }
     }
 
-    /// Landmarks that decoded to nothing: all 468 points on one pixel, with a
-    /// confident Face Mesh score beside them.
+    /// Landmarks that decoded to nothing: all 468 points on one pixel, with
+    /// Face Mesh scoring `score` beside them.
     ///
     /// Six coincident points are a constellation with no extent, which no
     /// rotation fits, so the pose solve refuses them — the shape a decode that
-    /// produced garbage takes.
-    fn landmarks_on_one_pixel() -> Landmarks {
+    /// produced garbage takes. The score is the caller's, because one test below
+    /// needs the dense stage's verdict to be *confident* (so that a refusal is
+    /// about the pose and nothing else) and another needs it *marginal* (so that
+    /// a field reading the verdict of a record that carries no reading is
+    /// visible).
+    fn landmarks_on_one_pixel(score: f32) -> Landmarks {
         Landmarks {
             points: [[0i32; 3]; 468],
-            score: 15.0,
+            score,
         }
     }
 
@@ -761,7 +765,7 @@ mod tests {
         // `valid: false` is what downstream code reads as "looking straight
         // ahead" when it forgets to check the flag.
         let faces = [face(0.93)];
-        let refused = landmarks_on_one_pixel();
+        let refused = landmarks_on_one_pixel(15.0);
         let obs = fuse(StageOutputs {
             tick_ms: 200,
             faces: &faces,
@@ -804,6 +808,34 @@ mod tests {
         assert_eq!(obs.primary, None);
         assert_eq!(obs.confidence.face, 0.0);
         assert_eq!(obs.confidence.overall, 0.0);
+
+        // And the *eye* field is the "no claim" value here, not the dense
+        // stage's verdict on landmarks the record does not contain: a refused
+        // pose leaves `Observation::primary` as `None`, so there is no eye
+        // reading to be wrong about. The score is deliberately marginal — a
+        // logit of `0` is a logistic of `0.5`, the value a field that read the
+        // verdict anyway would report, and the most visible one it could take.
+        let marginal = landmarks_on_one_pixel(0.0);
+        let obs = fuse(StageOutputs {
+            tick_ms: 200,
+            faces: &faces,
+            primary: Some(&faces[0]),
+            landmarks: Some(&marginal),
+            eye_closed: Some(false),
+            intrinsics: &k(),
+            phones: &[],
+            phone: PhoneSignal::None,
+            motion: 2.0,
+        });
+        assert_eq!(obs.primary, None, "still no reading");
+        assert_eq!(
+            obs.confidence.eye, 1.0,
+            "no eye reading in the record is not the same as an untrustworthy one"
+        );
+        assert_eq!(
+            obs.confidence.overall, 0.0,
+            "and the face field is what suppresses the tick"
+        );
 
         // The positive control, without which the two blocks above would pass
         // for a fixture that is unreadable for some other reason: the same box
@@ -1020,6 +1052,33 @@ mod tests {
             motion: 1.0,
         });
         assert_eq!(obs.confidence.phone, 0.44);
+
+        // Two cell-phone boxes in the one frame, which is what the module docs'
+        // upper-bound caveat is about: the field is the **strongest** of them,
+        // 0.92, so the tick stays above the floor. A rule that took the weakest
+        // box would read 0.44 and carry the tick forward, which is the recall
+        // the docs trade away knowingly — pinning the choice here means the
+        // trade cannot be reversed without a test failing.
+        let two_phones = [phone_box(0.92), phone_box(0.44)];
+        let obs = fuse(StageOutputs {
+            tick_ms: 1_000,
+            faces: &faces,
+            primary: Some(&faces[0]),
+            landmarks: Some(&landmarks),
+            eye_closed: Some(false),
+            intrinsics: &k(),
+            phones: &two_phones,
+            phone: PhoneSignal::InHand,
+            motion: 1.0,
+        });
+        assert_eq!(
+            obs.confidence.phone, 0.92,
+            "the strongest box in the frame bounds the verdict's score"
+        );
+        assert_eq!(
+            obs.confidence.overall, 0.90,
+            "and the face field, not the phone, is the least here"
+        );
     }
 
     #[test]
