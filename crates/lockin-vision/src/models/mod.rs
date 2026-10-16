@@ -19,6 +19,7 @@
 
 pub mod eyestate;
 pub mod facemesh;
+pub mod yolox;
 pub mod yunet;
 
 use std::sync::{Arc, Mutex};
