@@ -14,8 +14,7 @@
 //! for the real `ort` session in Task 19 changes one `Box<dyn ...>` and no
 //! wrapper code at all.
 //!
-//! Modules are declared here as they land: [`yunet`], [`facemesh`] and
-//! [`eyestate`] now, with the rest to follow.
+//! The model wrappers are declared below, one module per graph.
 
 pub mod eyestate;
 pub mod facemesh;
