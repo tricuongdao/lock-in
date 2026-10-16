@@ -19,6 +19,7 @@
 
 pub mod eyestate;
 pub mod facemesh;
+pub mod glasses;
 pub mod yolox;
 pub mod yunet;
 
