@@ -175,7 +175,7 @@ pub const INDICES: [usize; CORRESPONDENCES] = [33, 263, 1, 61, 291, 199];
 /// Only the ratios matter: the solve recovers a rotation and a distance, so
 /// scaling every column scales the distance and leaves the angles alone. What
 /// the absolute millimetres buy is the plausibility gate on that distance —
-/// [`NEAREST_MM`] and [`FARTHEST_MM`] are meaningful numbers only because the
+/// `NEAREST_MM` and `FARTHEST_MM` are meaningful numbers only because the
 /// model is in millimetres.
 pub const MODEL: [[f32; COORDINATES]; CORRESPONDENCES] = [
     [-45.0, -35.0, 25.0],
