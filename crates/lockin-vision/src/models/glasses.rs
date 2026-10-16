@@ -133,6 +133,36 @@
 //! the head's roll: the interface has no angle to give it, upstream does not
 //! rotate either, and photographic head crops at a moderate roll are what the
 //! model was trained on.
+//!
+//! ## What that sampling costs, measured, and why it was left alone
+//!
+//! The tensor was checked value by value against a PIL reference on a synthetic
+//! frame, and then the real model was run on both samplers over the seven
+//! portraits at their natural face-box sizes. Two differences turned up, and
+//! only one of them is real:
+//!
+//! * **Edge policy — no practical cost.** This wrapper clamps a sample to the
+//!   *frame*; PIL and cv2 clamp to the *crop*, so the outer one or two pixels
+//!   here read a sliver from just outside the box. A box-clamped variant was run
+//!   through the model as well: the worst logit difference between the two
+//!   policies is **0.003**, so it is not worth diverging from the rest of the
+//!   crate over.
+//! * **Filter support — real, bounded, accepted.** On a downscale PIL widens
+//!   its triangle to `step` source pixels where this 2x2 bilinear does not, and
+//!   that is the whole of the remaining difference: **0.01 to 1.44 logits**,
+//!   growing with how much larger than 256 the box is (worst case a 436x601
+//!   box, `step_y = 2.35`).
+//!
+//! The second was **not** changed, on evidence rather than taste. Across those
+//! seven faces the two samplers returned **the same verdicts, 7/7 correct**, so
+//! nothing measured supports a wider filter here — and there is an argument
+//! against one: the discriminative signal is a pair of thin, high-contrast rims,
+//! which is exactly what a widened kernel blurs. What is at stake in a near-miss
+//! is also smaller than it looks: a marginal logit does not produce a wrong
+//! *answer*, it produces an unadapted EAR threshold for one user. The honest
+//! disclosure is that one subject in that set — a 1931 studio portrait in round
+//! wire spectacles — sits at `+0.098` here against PIL's `+0.484`. Both are
+//! positive and the verdict is the same; the margin is thinner than PIL's.
 
 use crate::analyze::nms::Rect;
 use crate::frame::Frame;
