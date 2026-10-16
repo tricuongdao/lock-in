@@ -1589,6 +1589,15 @@ mod tests {
         assert_eq!(cold.tick_ms, 4_294_967_295);
         assert_eq!(cold.motion, f32::MAX);
 
+        // A cold start is a record the engine really writes, so the reload's own
+        // claim — a record this module produced is a fixed point of the wire —
+        // has to hold for it too. `f32::MAX` is the largest finite `f32`, which
+        // makes it the edge where a wire format could lose a measurement by
+        // overflowing it.
+        let json = serde_json::to_string(&cold).expect("a cold-start record serialises");
+        let back: Observation = serde_json::from_str(&json).expect("and loads back");
+        assert_eq!(back, cold, "a motion of f32::MAX survives the wire: {json}");
+
         let moving = fuse(StageOutputs {
             tick_ms: 12_345,
             faces: &faces,
