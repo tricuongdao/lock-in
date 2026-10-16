@@ -105,7 +105,7 @@
 //! which is what isolates the standardisation as the fault rather than a
 //! neighbouring choice.
 //!
-//! ## BGR or RGB: settled by measurement, and the answer is BGR
+//! ## BGR or RGB: measured, BGR adopted, margin narrow
 //!
 //! This is the one part of the convention that is **not** settled by a large
 //! margin, and an earlier version of this file asserted it as fact on the
@@ -147,10 +147,14 @@
 //! `legacy` eval path, not this ONNX export — and that is a claim the
 //! measurements above support and the file-path argument did not.
 //!
-//! Under the brief's regime the detector returned **no boxes at all** on all
-//! three images; under the raw scale it returns every person present. See
-//! [`preprocess`] for the table and
-//! `research/yolox/diagnose_preprocessing.py` for the measurement.
+//! Under the brief's regime the detector returned **no boxes at all** on the
+//! three images this comparison was run on; under the raw scale it returns
+//! boxes on all three, and the boxes it returns are the objects that are
+//! visibly there. Those three images carry **no ground-truth labels**, so that
+//! is a qualitative comparison and not a measured recall — the labelled numbers
+//! are the 18-image phone evaluation described under [`YoloxNano::detect`]. See
+//! [`preprocess`] for the table and `research/yolox/diagnose_preprocessing.py`
+//! for the measurement.
 //!
 //! This is the second time in this task that a plausible-looking output hid a
 //! total failure, and it is the reason the preprocessing regime has its own
@@ -895,21 +899,50 @@ impl YoloxNano {
     /// | tiny | 5.0M | 29.0 ms | 0.941 / 0.381 / 0.542 | **68%** | 0.870 / 0.800 / 0.833 |
     /// | s (640²) | 9.0M | 93.6 ms | 0.957 / 0.524 / 0.677 | **68%** | 0.750 / 0.840 / 0.792 |
     ///
-    /// **All three variants are identical — 68% recall — on phones that occupy
-    /// at least 2% of the frame**, which is the case a desk webcam sees. The
-    /// 0.33/0.38/0.52 headline recall is entirely about COCO's very small,
-    /// edge-on and occluded instances: in the `<0.2%` bucket nano and tiny find
-    /// **none** while `s` finds 32%. So nano's deficit is real but confined to
-    /// phones this product does not need to see, and the shipped variant stays
-    /// nano. `s` is the variant to move to if arm's-length phone use ever becomes
-    /// a requirement; it costs 11x the inference and changes one constant
+    /// **All three variants score the same on phones that occupy at least 2% of
+    /// the frame: 13 of 19 instances (68%) and 9 of 11 images (82%).** The
+    /// 0.33/0.38/0.52 headline recall is about COCO's very small, edge-on and
+    /// occluded instances instead: in the `<0.2%` bucket, of 19 instances, nano
+    /// and tiny find **none** and `s` finds 6 (32%).
+    ///
+    /// **Three qualifications on that, because the table is easy to over-read:**
+    ///
+    /// * The `>=2%` equality is **absence of evidence, not demonstrated
+    ///   equivalence**: 19 instances per bucket, no confidence interval, and the
+    ///   18 images were *chosen* to span the size range, so the bucket may be a
+    ///   ceiling that a larger sample would separate.
+    /// * **No desk-domain frame was evaluated.** Every image here is COCO
+    ///   val2017. The claim "a phone at a desk is a `>=2%` phone" is a
+    ///   *reasoning step*, not a measurement, and this task did not test it.
+    /// * Whether `<0.2%` phones matter is therefore a **product** question this
+    ///   wrapper cannot answer from its own evidence.
+    ///
+    /// So the shipped variant stays nano on the strength of the `>=2%` numbers,
+    /// at a third of tiny's and a ninth of `s`'s inference time.
+    ///
+    /// **When to move to `s`, in the direction the data actually supports:**
+    /// `s` wins in the **`<0.2%`** bucket — **far or very small** phones — not
+    /// on arm's-length ones. Arm's length makes a phone *bigger*, into the `>=2%`
+    /// bucket where all three tie. The upgrade is therefore for **distant or
+    /// tiny** phones, and it costs about 11x the inference for one constant
     /// (`INPUT_SIZE`, with the anchor count already derived from it).
     ///
-    /// The threshold is unchanged at 0.25, re-derived on this set rather than
-    /// inherited: for nano it is the phone-F1 optimum of the sweep (F1 0.483 at
-    /// 0.25 against 0.522 at 0.05, but at 0.875 precision against 0.667 — and for
-    /// this product a false phone is a false `PhoneInUse` nudge, so precision
-    /// dominates) and it sits within 0.001 of nano's person-F1 optimum.
+    /// # Why 0.25, and it is not the F1 optimum
+    ///
+    /// **The threshold is chosen for precision, not for F1, and saying otherwise
+    /// would be false.** On nano's phone sweep the best *F1* is at **0.05**
+    /// (0.522), falling to 0.467 at 0.15, **0.483 at 0.25** and 0.437 at 0.40 —
+    /// so 0.25 is not the F1 optimum and an earlier version of this comment
+    /// claimed it was.
+    ///
+    /// 0.25 is chosen because **precision rises monotonically with the threshold
+    /// while recall falls**, and for this product a false phone is a false
+    /// `PhoneInUse` nudge: at 0.25 precision is **0.875** against **0.667** at
+    /// 0.05, i.e. roughly one spurious phone box in eight instead of one in
+    /// three, bought for a recall drop of 0.429 to 0.333. On nano's *person*
+    /// sweep the numbers are 0.821 precision / 0.640 recall at 0.25 against
+    /// 0.733 / 0.660 at 0.20 and 0.838 / 0.620 at 0.30, so 0.25 sits in a flat
+    /// region of that curve rather than on a peak.
     ///
     /// # What the boxes mean
     ///
@@ -2492,24 +2525,36 @@ mod tests {
     }
 
     #[test]
-    fn decode_matches_the_eval_harness() {
-        // The phone evaluation in `research/yolox/` re-implements `decode_row`
-        // in Python. If that re-implementation differed from this one, the
-        // measured precision and recall would describe the Python rather than
-        // the shipped code — the same trap as R39, one layer up.
+    fn decode_pins_its_arithmetic_on_a_known_row_set() {
+        // **What this test is not.** An earlier version was called
+        // `decode_matches_the_eval_harness` and its comment claimed the Rust
+        // decode and the Python evaluation harness were "byte-identical". That
+        // claim is **retracted**: this test never runs Python, and nothing in
+        // the repository can reproduce the comparison, because the harness and
+        // its image manifest live under a gitignored `research/` directory. A
+        // test cannot pin an identity against an artefact it does not read.
         //
-        // This drives the *real* `decode_row` over a fixture and prints the
-        // detections, so the printed answer can be lined up against what the
-        // Python harness produces for the same rows. The tensor is synthetic
-        // because this crate's tests do no I/O and the ONNX file is not
-        // available to them; what is being checked is the decode arithmetic —
-        // grid offsets, `exp` scaling, score, class filter and NMS — not the
-        // model.
+        // What *is* true, and what the measured precision/recall therefore rest
+        // on: the harness's `decode` was written to mirror `decode_row` — best
+        // class **among the wanted classes**, then threshold, then class-aware
+        // NMS — and the two were compared by hand once, on this fixture,
+        // producing the same two detections with the same rectangles. That is a
+        // **one-off observation, not a regression guard**, and it covers only
+        // the decode. The harness's *letterbox*, pad value and channel order are
+        // its own code and are cross-checked **nowhere** — the R39 layer, still
+        // uncovered.
+        //
+        // So: read the phone numbers in `detect`'s docs as measured by a harness
+        // that reproduces this arithmetic as far as it was checked by hand, and
+        // treat the harness itself as unverifiable from the repository.
+        //
+        // What this test pins: the decode arithmetic, against hand-computed
+        // literals. It fails if the grid offsets, the `exp` scaling, the score,
+        // the class filter, the argmax tie-break or NMS change.
         let frame = letterboxed_frame((10, 20, 30));
 
-        // Two overlapping phone rows and a person row, so the class filter, the
-        // score and NMS all contribute to the printed answer, plus one phone row
-        // below threshold.
+        // Two overlapping phone rows and a person row, plus one phone row below
+        // threshold, so every stage of the decode contributes to the answer.
         let mut raw = blank_predictions();
         set_row(
             &mut raw,
@@ -2535,49 +2580,56 @@ mod tests {
         let (detector, _) = detector_returning(predictions_output(raw));
         let detections = detector.detect(&frame).expect("a well-formed output");
 
-        println!("RUST DECODE CHECK");
-        for detection in &detections {
-            println!(
-                "  class={:2} score={:.6} rect=({:.4}, {:.4}, {:.4}, {:.4})",
-                detection.class_id,
-                detection.score,
-                detection.rect.x,
-                detection.rect.y,
-                detection.rect.w,
-                detection.rect.h
-            );
-        }
+        // Two detections, strongest first. Row 3 is below threshold; row 1
+        // loses to row 0 on score within the same class; the person at row 2 is
+        // a different class on the same rectangle, so class-aware NMS keeps it.
+        assert_eq!(detections.len(), 2, "{detections:?}");
+        assert_eq!(detections[0].class_id, CELL_PHONE_CLASS);
+        // `0.9 * 0.95` is **not** exactly 0.855 in f32 — it is 0.85499996 — and
+        // that is the value the decoder produces for row 0. Asserted against the
+        // product rather than the decimal, because the decimal is a rounding of
+        // the product and asserting it would be asserting something false.
+        assert_eq!(detections[0].score, 0.9f32 * 0.95f32);
+        assert_ne!(
+            detections[0].score, 0.855f32,
+            "and it is deliberately not the rounded decimal"
+        );
+        assert_eq!(detections[1].class_id, PERSON_CLASS);
+        assert_eq!(
+            detections[1].score,
+            0.9f32 * 0.95f32,
+            "row 2 has the same configured scores as row 0"
+        );
 
-        // Hand-computed expectations, so the test is not merely a print. All
-        // four rows are at stride 8; the class score is what decides which phone
-        // survives, and the person is a different class so it is never
-        // suppressed against them.
+        // The rectangles as **literals**, not prints. These are what the
+        // retracted "byte-identical" claim rested on, so they are asserted.
+        //
+        // Row 0 is grid (0, 0) of stride 8, so its centre is the tensor origin
+        // and the box is `exp(1.0) * 8 = 21.746275` wide there; the letterbox
+        // scale is 0.25, so in the frame the box is 86.9851 wide and starts at
+        // -43.49255. (The exact f32 values are asserted below; these are the
+        // hand-computed decimals they should round to.)
+        // Row 0 is grid (0, 0) of stride 8, so its centre is the tensor origin
+        // and the box is `exp(1.0) * 8 = 21.746275` across there; the letterbox
+        // scale is 0.25, so the frame box is 86.985016 wide and starts at
+        // -43.492508. Every value here is the literal the decoder produces, and
+        // all five differed from my first hand-rounded guesses by one or two
+        // f32 ulps — the arithmetic is `(0 + 0) * 8` then `- exp(1)*8/2` then
+        // `/ 0.25`, and each step rounds.
+        assert_eq!(detections[0].rect.x, -43.492508_f32);
+        assert_eq!(detections[0].rect.y, -43.492508_f32);
+        assert_eq!(detections[0].rect.w, 86.985016_f32);
+        assert_eq!(detections[0].rect.h, 86.985016_f32);
+        // Row 2 is grid (2, 0) of stride 8, so its centre is two cells along:
+        // 16 tensor pixels, 64 frame pixels — the only difference from row 0.
+        assert_eq!(detections[1].rect.x, 20.507492_f32);
+        assert_eq!(detections[1].rect.y, -43.492508_f32);
+        assert_eq!(detections[1].rect.w, 86.985016_f32);
+        assert_eq!(detections[1].rect.h, 86.985016_f32);
         assert_eq!(
-            detections.len(),
-            2,
-            "row 3 is below threshold and row 1 is suppressed as a duplicate of \
-             row 0's class: {detections:?}"
-        );
-        let phones: Vec<_> = detections
-            .iter()
-            .filter(|det| det.class_id == CELL_PHONE_CLASS)
-            .collect();
-        assert_eq!(phones.len(), 1, "the weaker phone duplicate is suppressed");
-        assert_eq!(
-            phones[0].score,
-            0.9 * 0.95,
-            "0.855, the strongest phone row"
-        );
-        assert_eq!(
-            phones[0].rect.w,
-            1.0f32.exp() * 8.0 * 4.0,
-            "exp(1) * stride 8, out of the letterbox"
-        );
-        // The person row is a different class at the same place, so class-aware
-        // NMS keeps both — and the fixture's IoU between them is 1.0.
-        assert!(
-            detections.iter().any(|det| det.class_id == PERSON_CLASS),
-            "the person survives despite sitting on the phone: {detections:?}"
+            detections[1].rect.x - detections[0].rect.x,
+            64.0,
+            "row 2 is two stride-8 cells along from row 0"
         );
     }
 
