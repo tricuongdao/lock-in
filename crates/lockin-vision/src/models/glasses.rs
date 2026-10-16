@@ -780,13 +780,17 @@ mod tests {
 
         let (present, _) = detector_returning(logits_output(6.543));
         assert!(
-            present.detect(&frame, &window).expect("a well-formed output"),
+            present
+                .detect(&frame, &window)
+                .expect("a well-formed output"),
             "a positive logit must reach the caller as glasses present"
         );
 
         let (absent, _) = detector_returning(logits_output(-10.474));
         assert!(
-            !absent.detect(&frame, &window).expect("a well-formed output"),
+            !absent
+                .detect(&frame, &window)
+                .expect("a well-formed output"),
             "a negative logit must reach the caller as absent"
         );
 
@@ -877,9 +881,8 @@ mod tests {
         // The whole green plane stays within the box's own rows, as a range
         // rather than at two sampled points. The plane is a linear ramp in the
         // row, so its extremes are its endpoints.
-        let greens: Vec<f32> = values(&tensor)
-            [INPUT_SIZE * INPUT_SIZE..2 * INPUT_SIZE * INPUT_SIZE]
-            .to_vec();
+        let greens: Vec<f32> =
+            values(&tensor)[INPUT_SIZE * INPUT_SIZE..2 * INPUT_SIZE * INPUT_SIZE].to_vec();
         assert_eq!(
             greens.iter().copied().fold(f32::INFINITY, f32::min),
             norm_green(31.5625)
@@ -1061,7 +1064,9 @@ mod tests {
             data: TensorData::F32(vec![1.0, 2.0]),
         });
         assert!(
-            wrong_shape.as_ref().is_err_and(|message| message.contains("[1, 2]")),
+            wrong_shape
+                .as_ref()
+                .is_err_and(|message| message.contains("[1, 2]")),
             "a wrong shape must report what it got, got {wrong_shape:?}"
         );
 
@@ -1074,7 +1079,9 @@ mod tests {
             data: TensorData::F32(Vec::new()),
         });
         assert!(
-            short.as_ref().is_err_and(|message| message.contains("holds 0")),
+            short
+                .as_ref()
+                .is_err_and(|message| message.contains("holds 0")),
             "a short buffer must report its actual length, got {short:?}"
         );
 
@@ -1095,7 +1102,9 @@ mod tests {
         // Two heads where the graph declares one: this wrapper reads the
         // verdict from a single value and has no rule for a second.
         let two = detector_returning_outputs(vec![logits_output(1.0), logits_output(-1.0)]);
-        let two = two.detect(&frame, &window).map_err(|error| error.to_string());
+        let two = two
+            .detect(&frame, &window)
+            .map_err(|error| error.to_string());
         assert!(
             two.as_ref()
                 .is_err_and(|message| message.contains("2 output") && message.contains("1")),
