@@ -2,16 +2,32 @@
 //!
 //! This wrapper answers one yes/no question, once, while the user calibrates:
 //! **are they wearing glasses?** Nothing else in the crate consumes the answer
-//! yet — Task 18 wires it into the profile, where it raises the eye-aspect-ratio
-//! threshold, because eyewear is the *documented* failure mode for EAR. Rimless
-//! and transparent lenses shift the landmark positions around the eye without
-//! darkening anything, so the ratio moves with no other symptom, and `Drowsy`
-//! then fires either always or never for that user. A flag nothing reads would
-//! be worse than no flag, which is why Task 18 must consume this one.
+//! yet — Task 18 wires it into the profile, where it adjusts the
+//! eye-aspect-ratio threshold, because eyewear is the *documented* failure mode
+//! for EAR. Rimless and transparent lenses shift the landmark positions around
+//! the eye without darkening anything, so the ratio moves with no other symptom,
+//! and `Drowsy` then fires either always or never for that user. A flag nothing
+//! reads would be worse than no flag, which is why Task 18 must consume this one.
+//!
+//! **This module deliberately does not say which way the threshold moves.**
+//! `true` means glasses are present and nothing more; whether that should raise
+//! the EAR threshold, lower it, or change the `Drowsy` agreement rule is Task
+//! 18's to decide against how eyewear actually moves measured EAR on real faces.
+//! Asserting a direction here would be a guess dressed as a specification, and
+//! the sign is not self-evident — a lens can as easily prop an eyelid open as a
+//! rim can occlude it.
 //!
 //! It runs **only during calibration, never per tick**. That is what makes the
 //! cost irrelevant and the correctness decisive: one 256x256 forward pass per
 //! calibration, in exchange for a threshold that is right for the whole session.
+//!
+//! Being calibration-only is also a constraint on the *caller*: the thinnest
+//! margin measured anywhere in this task is a logit of `+0.098`, where a single
+//! frame effectively decides the flag. A calibration that samples several frames
+//! and averages the logit is materially more trustworthy than one that asks
+//! once, and this interface returns a `bool` rather than the logit, so that
+//! averaging is Task 18's to arrange — it would need the raw value, and
+//! [`GlassesDetector`] does not expose it.
 //!
 //! # The graph, read rather than assumed
 //!
@@ -47,10 +63,21 @@
 //! `ln(3) = 1.0986` — it would silently discard every marginal positive.
 //!
 //! The decision boundary here is therefore the logit's zero, and [`glasses_present`]
-//! is where that lives. Note honestly what that means: `logit > 0.0` and
-//! `sigmoid(logit) > 0.5` are the *same predicate*, so a wrapper that applied a
-//! sigmoid would be indistinguishable through this interface. What is pinned is
-//! the boundary and the raw value's freedom to leave `[0, 1]` unpunished.
+//! is where that lives.
+//!
+//! **`logit > 0.0` and `sigmoid(logit) > 0.5` are *not* the same predicate in
+//! `f32`, and an earlier version of this note wrongly said they were.** `f32`'s
+//! `exp` saturates: `(-x).exp()` is exactly `1.0` for every `0 < x` up to
+//! `1.2318972e-07`, so `1.0 / (1.0 + 1.0)` is exactly `0.5` there and
+//! `sigmoid(x) > 0.5` is **false** while `x > 0.0` is true. The two disagree on
+//! the whole interval `0 < logit <= 1.2318972e-07` — about `f32::EPSILON` — and
+//! agree everywhere else, including exactly at `0.0`, where both are false. So a
+//! wrapper that applied a sigmoid is *nearly* indistinguishable through this
+//! interface and not exactly so, and `positive_logit_means_glasses_present`
+//! asserts a logit of `1e-12` is present, which is what closes it.
+//!
+//! What remains unpinnable is only the numerical sliver above that bound: no
+//! test can tell the two apart for a logit of `1e-6`, and none claims to.
 //!
 //! # Which head, and why it is not the sunglasses one
 //!
@@ -98,10 +125,21 @@
 //! report. Measured on the same seven crops, applying the mean and std to the
 //! raw 0-255 bytes instead drives `anyglasses_medium` to `-1559` and `-2877` on
 //! the very images it otherwise calls confidently positive, taking it from 7/7
-//! to 3/7. The three other wrappers in this crate each have their own regime and
-//! none of them may be folded together: Face Mesh reverses to RGB and scales by
-//! `1/255` with no mean; YOLOX takes raw BGR `0-255` letterboxed; the eye
-//! classifier takes BGR `(x - 127) / 255`. Mixing any two of these produces
+//! to 3/7.
+//!
+//! **What that table does and does not prove.** It isolates the `/255` and its
+//! *order* relative to the mean: regime C is the same arithmetic with the
+//! division dropped, and it is catastrophic. It does **not** show that the mean
+//! and std are themselves necessary for these verdicts — regime D is a bare
+//! `/255` with no mean at all, and it also scores 7/7 on these seven images, just
+//! as regime B shows the channel order is not separable from this table either.
+//! The mean, the std and the RGB order are therefore taken from the reference
+//! implementation and from what the graph was trained on, not from this
+//! measurement; only the `/255` and its position are measured as load-bearing.
+//! The three other wrappers in this crate each have their own regime and none of
+//! them may be folded together: Face Mesh reverses to RGB and scales by `1/255`
+//! with no mean; YOLOX takes raw BGR `0-255` letterboxed; the eye classifier
+//! takes BGR `(x - 127) / 255`. Mixing any two of these produces
 //! plausible-looking numbers rather than an error.
 //!
 //! # The resize squeezes; it does not letterbox
@@ -147,22 +185,38 @@
 //!   through the model as well: the worst logit difference between the two
 //!   policies is **0.003**, so it is not worth diverging from the rest of the
 //!   crate over.
-//! * **Filter support — real, bounded, accepted.** On a downscale PIL widens
-//!   its triangle to `step` source pixels where this 2x2 bilinear does not, and
-//!   that is the whole of the remaining difference: **0.01 to 1.44 logits**,
-//!   growing with how much larger than 256 the box is (worst case a 436x601
-//!   box, `step_y = 2.35`).
+//! * **Filter support — real, bounded, accepted.** PIL's kernel is wider than a
+//!   2x2 bilinear: on a downscale its triangle grows to `step` source pixels,
+//!   and its *default* — which is what the cited pipeline actually calls —
+//!   is bicubic. Both were measured. Against `Resampling.BICUBIC`, the kernel
+//!   `demo_classification_sunglasses.py` gets by calling
+//!   `crop.resize(CLASSIFIER_INPUT_SIZE)` with no filter argument, the worst
+//!   difference is **0.70 logits**, on a 436x601 box with `step_y = 2.35`.
+//!   Against an explicitly-bilinear reference it is **1.44**, on the same box.
+//!   An earlier version of this note quoted 1.44 as the bound for the training
+//!   pipeline; that number is bilinear-vs-bilinear and does not describe the
+//!   kernel the pipeline uses. The bicubic figure is the one that does.
 //!
-//! The second was **not** changed, on evidence rather than taste. Across those
-//! seven faces the two samplers returned **the same verdicts, 7/7 correct**, so
-//! nothing measured supports a wider filter here — and there is an argument
-//! against one: the discriminative signal is a pair of thin, high-contrast rims,
-//! which is exactly what a widened kernel blurs. What is at stake in a near-miss
-//! is also smaller than it looks: a marginal logit does not produce a wrong
-//! *answer*, it produces an unadapted EAR threshold for one user. The honest
-//! disclosure is that one subject in that set — a 1931 studio portrait in round
-//! wire spectacles — sits at `+0.098` here against PIL's `+0.484`. Both are
-//! positive and the verdict is the same; the margin is thinner than PIL's.
+//! The kernel gap was **not** closed, on evidence rather than taste. Across
+//! those seven faces the sampler returned **the same verdicts as both
+//! references, 7/7 correct**, so nothing measured supports a wider filter here —
+//! and there is an argument against one: the discriminative signal is a pair of
+//! thin, high-contrast rims, which is exactly what a widened kernel blurs. What
+//! is at stake in a near-miss is also smaller than it looks: a marginal logit
+//! does not produce a wrong *answer*, it produces an unadapted EAR threshold for
+//! one user. The honest disclosure is the thin margin: one subject in that set —
+//! a 1931 studio portrait in round wire spectacles, the smallest margin measured
+//! anywhere in this task — sits at `+0.098` through this sampler, against
+//! `+0.407` through the reference's bicubic kernel.
+//!
+//! Two consequences belong to later tasks rather than to this one. A logit that
+//! small means a **single frame decides the flag**, so calibration should not
+//! trust one — averaging the logit over a handful of calibration frames is the
+//! obvious remedy and is Task 18's call. And upstream's only *published* cutoff
+//! is `0.75` on the sigmoid, i.e. a logit of `1.0986`, which would call that
+//! subject **negative**; the operating point here (a logit above zero, the
+//! sigmoid's `0.5`) is deliberately more sensitive than the only threshold the
+//! reference publishes.
 
 use crate::analyze::nms::Rect;
 use crate::frame::Frame;
@@ -214,11 +268,16 @@ const STD: [f32; CHANNELS] = [0.229, 0.224, 0.225];
 /// probability, and why a caller must not threshold it at the demo's `0.75`.
 ///
 /// A value of **exactly** `0.0` is *not* glasses, and that direction is chosen
-/// rather than observed. The only consumer is a profile flag that raises the
-/// eye-aspect-ratio threshold, which makes `Drowsy` easier to raise; like the
-/// eye classifier's tie, this one has to earn that. A logit lands on exactly
-/// zero with probability zero on real pixels, so this is a specified boundary
-/// rather than a measured one.
+/// rather than observed. The only consumer is a profile flag that moves the
+/// eye-aspect-ratio threshold, and which way it moves is Task 18's to decide —
+/// see the module docs. What is *not* in doubt is that an exactly-zero logit
+/// carries no evidence either way, so it should not manufacture a positive; a
+/// logit lands on exactly zero with probability zero on real pixels, which makes
+/// this a specified boundary rather than a measured one.
+///
+/// A logit of `1e-12` **is** glasses, and that is not a formality: `f32`'s `exp`
+/// saturates, so a wrapper that applied a sigmoid would call it negative. See
+/// the module docs, and the assertion in `positive_logit_means_glasses_present`.
 pub fn glasses_present(logit: f32) -> bool {
     logit > 0.0
 }
@@ -471,10 +530,11 @@ impl GlassesDetector {
     /// Whether the person in `face` is wearing glasses.
     ///
     /// `true` is glasses present, and the caller is calibration: the answer
-    /// becomes a profile flag that **raises** the eye-aspect-ratio threshold,
-    /// because eyewear shifts the eye landmarks and moves the ratio with no
-    /// other symptom. A caller that ignores this return leaves the documented
-    /// failure mode in place for every user who wears glasses.
+    /// becomes a profile flag on the EAR threshold, because eyewear shifts the
+    /// eye landmarks and moves the ratio with no other symptom. **Which way that
+    /// flag moves the threshold is Task 18's decision, not this wrapper's** —
+    /// see the module docs. A caller that ignores this return leaves the
+    /// documented failure mode in place for every user who wears glasses.
     ///
     /// `face` is one detection from stage 1, in `frame`'s coordinates, and its
     /// `rect` is the window that is cropped — measured to reach the same
@@ -484,7 +544,9 @@ impl GlassesDetector {
     /// Costs one 256x256 RGB tensor per call — 196,608 floats. That is the
     /// largest single input in this crate, and it is affordable precisely
     /// because this runs once: the per-tick stages either side of it build
-    /// tensors a fraction of this size.
+    /// tensors a fraction of this size. The thinnest margin measured is a logit
+    /// of `+0.098`, so a caller wanting a stable flag should call this over
+    /// several calibration frames rather than trusting one.
     pub fn detect(&self, frame: &Frame, face: &FaceBox) -> Result<bool, ModelError> {
         let input = preprocess(frame, &face.rect);
         let outputs = self.session.run(&[input])?;
@@ -604,13 +666,33 @@ mod tests {
         );
 
         let plane = INPUT_SIZE * INPUT_SIZE;
-        // Hand-computed from the brief's own constants:
+        // What the tensor actually holds at one pixel of each plane. Hand-computed
+        // from the brief's own constants:
         //   red   = (255/255 - 0.485) / 0.229 =  0.515 / 0.229 =  2.248908
         //   green = (128/255 - 0.456) / 0.224 =  0.045961 / 0.224 =  0.205183
         //   blue  = (  0/255 - 0.406) / 0.225 = -0.406 / 0.225 = -1.804444
-        let red = norm(255.0);
-        let green = norm_green(128.0);
-        let blue = norm_blue(0.0);
+        //
+        // Read from `tensor`, not from the local helpers: an assertion comparing
+        // `norm(255.0)` with `2.248908` compares two test-local numbers and cannot
+        // fail whatever the production code does. These are the production values,
+        // so each of them can.
+        //
+        // The three ways to get the regime wrong produce three different numbers,
+        // and naming them here is what makes a failure diagnosable — the `got`
+        // values in the messages are one of these:
+        //   * dropping the `/255` puts red at `(255 - 0.485) / 0.229 = 1111.4`.
+        //     Not hypothetical: on seven real head crops that took the shipping
+        //     model from 7/7 to 3/7, driving the glasses-wearers to -1559;
+        //   * a bare `x / 255` with no mean leaves the 0 byte at exactly `0.0`,
+        //     where blue must be `-1.804444`;
+        //   * a BGR pass-through puts `norm_blue(255.0) = 2.889` in plane 0,
+        //     where red must be `2.248908`.
+        let red = at(&tensor, 0, 0, 0);
+        let green = at(&tensor, 1, 0, 0);
+        let blue = at(&tensor, 2, 0, 0);
+        let want_red = norm(255.0);
+        let want_green = norm_green(128.0);
+        let want_blue = norm_blue(0.0);
         // The three are distinct, so a channel-order swap cannot pass by
         // coincidence, and their decimals are named so a failure says which of
         // the three constants moved.
@@ -626,35 +708,19 @@ mod tests {
                 let got = &values(&tensor)[index..];
                 assert_eq!(
                     [got[0], got[plane], got[2 * plane]],
-                    [red, green, blue],
+                    [want_red, want_green, want_blue],
                     "plane order at ({column}, {row})"
                 );
             }
         }
 
-        // The halves of the affine map, named so that dropping one fails with a
-        // message that says which. Without the `/255`, red would be
-        // `(255 - 0.485) / 0.229 = 1111.4` -- and that is not hypothetical
-        // either: on seven real head crops, applying the mean and std to the raw
-        // 0-255 bytes took the shipping model from 7/7 to 3/7, driving the
-        // glasses-wearers to -1559 and -2877.
-        assert!(
-            red < 3.0,
-            "the /255 is present: applying mean and std to raw 0-255 bytes \
-             would put red at 1111.4, got {red}"
-        );
-        assert!(
-            blue < 0.0,
-            "and the mean is subtracted after it: a bare x/255 would leave the \
-             0 byte at exactly 0.0, got {blue}"
-        );
-        // Red is the channel the frame holds last, so a wrapper that passed BGR
-        // through would put `norm_blue(255.0) = 2.889` in plane 0 instead.
-        assert_ne!(
-            red,
-            (255.0f32 / 255.0 - 0.406) / 0.225,
-            "plane 0 is the red byte, not the blue one"
-        );
+        // There is deliberately no `red < 3.0` / `blue < 0.0` / `red != 2.889`
+        // here. Each was once written against the *local* helpers, so it could
+        // not fail; pointing them at the tensor makes them able to fail but not
+        // *independent* — passing the exact assertion immediately above implies
+        // all three, so their failure paths are unreachable and their messages
+        // never print. An assertion that cannot be the one that fires is worth
+        // less than the comment that explains what to look for, which is above.
     }
 
     #[test]
@@ -666,23 +732,46 @@ mod tests {
         assert!(glasses_present(3.280), "and a second one");
         assert!(
             glasses_present(0.407),
-            "the weakest real positive measured: a wire-rimmed pair, and still \
-             above the boundary"
+            "a real positive: a wire-rimmed pair through the reference's own \
+             bicubic crop, and comfortably above the boundary"
         );
         assert!(!glasses_present(-5.141), "a real face with no glasses");
         assert!(!glasses_present(-10.474), "and a second one");
 
         // The boundary is the logit's zero, which is the sigmoid's 0.5. Pinned
-        // from both sides and *at* zero, because the flag this feeds raises the
-        // EAR threshold and therefore makes `Drowsy` easier to raise: like the
-        // eye classifier's tie, it has to earn that. A value of exactly 0.0 is
-        // not positive, so it is not glasses.
+        // from both sides and *at* zero. A value of exactly 0.0 is not positive,
+        // so it is not glasses: an exactly-zero logit carries no evidence either
+        // way and must not manufacture a positive.
         assert!(glasses_present(0.001), "just above zero is present");
         assert!(
             !glasses_present(0.0),
-            "a tie is not glasses: the flag makes Drowsy easier to raise"
+            "a tie is not glasses: it carries no evidence either way"
         );
         assert!(!glasses_present(-0.001), "just below zero is absent");
+
+        // And then the value that makes this test more than a formality.
+        //
+        // `logit > 0.0` and `sigmoid(logit) > 0.5` are NOT the same predicate in
+        // f32, and the difference lives here. f32's `exp` saturates: `(-x).exp()`
+        // is exactly 1.0 for every 0 < x <= 1.2318972e-07, so `1.0 / (1.0 + 1.0)`
+        // is exactly 0.5 and `sigmoid(x) > 0.5` is FALSE while `x > 0.0` is true.
+        // The two predicates therefore disagree on `0 < logit <= 1.2318972e-07`
+        // -- about `f32::EPSILON` -- and this assertion is what pins the side of
+        // that interval this wrapper is on. A wrapper that pushed the raw logit
+        // through a sigmoid would call this absent.
+        //
+        // `f32::MIN_POSITIVE` is the same value taken to its extreme: the
+        // smallest positive normal is also called absent by a sigmoid, and
+        // present here.
+        assert!(
+            glasses_present(1e-12),
+            "a logit of 1e-12 is positive, so it is glasses present -- and a \
+             sigmoid would call it exactly 0.5 and therefore absent"
+        );
+        assert!(
+            glasses_present(f32::MIN_POSITIVE),
+            "and so is the smallest positive normal"
+        );
 
         // And the same through the session, because the boundary living in
         // `glasses_present` is worth nothing if `detect` does not reach it.
