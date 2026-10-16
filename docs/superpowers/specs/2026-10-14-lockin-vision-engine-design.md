@@ -315,9 +315,11 @@ authoritative: index 0 is closed.** Trusting the README would invert `Drowsy` in
 **Normalisation is mandatory, not cosmetic.** Raw 0–255 input yields **NaN**, not
 merely degraded output.
 
-**The eye box** comes from stage-2 landmarks: a square 1.8× the inter-landmark eye
-distance, roll-corrected before cropping. That is the geometry OpenVINO's own gaze
-demo uses, and it is what makes the domain match hold.
+**The eye box** is derived from stage-2 landmarks, and its construction was **corrected against OpenVINO's own source** after review showed the original wording described a different region entirely:
+
+- **One box per eye, not one box for the face.** OpenVINO's `EyeStateEstimator::createEyeBoundingBox` is called with each eye's own two corner landmarks and returns a square centred on *that* eye. Using the outer corners across the face (`33`–`263`) and centring on the nose bridge yields a both-eyes inter-ocular region at roughly 3.6× the reference framing — against a model whose training data is single-eye closeups. That defeats the very domain match this classifier was adopted for.
+- Per eye: `d = ‖outer − inner‖` (left `33`–`133`, right `362`–`263`), box side `1.8 × d`, centred on their midpoint.
+- **Rotation is part of the crop, not a property of the rectangle.** The reference crops the axis-aligned square and then rotates the *crop* by head roll before inference. A rectangle cannot carry its own roll, so the angle travels alongside the box and is applied at resample time. An axis-aligned enclosure is not a substitute: its side is `1.8d(|cosθ| + |sinθ|) ≥ 1.8d`, so it cannot be both an enclosure and `1.8d`, and at 45° it does not even contain the reference square.
 
 **Rejected alternatives, and why:**
 
