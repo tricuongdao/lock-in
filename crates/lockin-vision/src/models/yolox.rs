@@ -1612,6 +1612,51 @@ mod tests {
     }
 
     #[test]
+    fn sigmoid_is_total_in_both_tails() {
+        // The score is this wrapper's own activation, and the textbook
+        // `1 / (1 + exp(-x))` overflows in the *negative* tail: `exp(88.8)` is
+        // `inf`, so `1 / inf` is `0.0`. That is the right limit reached by an
+        // infinity rather than by arithmetic, and it is why the two-branch form
+        // is worth its extra line — but reading a NaN out of a garbage tensor is
+        // the failure this crate's rule forbids, and only an extreme input tells
+        // the two spellings apart.
+        for x in [
+            -1000.0f32,
+            -88.8,
+            -20.0,
+            -1.0,
+            0.0,
+            1.0,
+            20.0,
+            88.8,
+            1000.0,
+            f32::MIN,
+            f32::MAX,
+        ] {
+            let p = sigmoid(x);
+            assert!(p.is_finite(), "sigmoid({x}) must be finite, got {p}");
+            assert!(
+                (0.0..=1.0).contains(&p),
+                "sigmoid({x}) must be a probability, got {p}"
+            );
+        }
+        // The limits, and the value that has to be exact for this file's own
+        // score expectations to be exact: `sigmoid(0)` is a power of two, so
+        // `0.5 * 0.5` is 0.25 with no rounding at all.
+        assert_eq!(sigmoid(0.0), 0.5);
+        assert_eq!(sigmoid(-1000.0), 0.0, "the negative tail reaches zero");
+        assert_eq!(sigmoid(1000.0), 1.0, "and the positive tail one");
+        assert!(
+            sigmoid(-88.8) > 0.0,
+            "reached by arithmetic, not by 1/inf: {}",
+            sigmoid(-88.8)
+        );
+        // Monotone, which is what makes the class argmax unaffected by the
+        // second sigmoid the brief's score applies to an already-activated head.
+        assert!(sigmoid(-1.0) < sigmoid(0.0) && sigmoid(0.0) < sigmoid(1.0));
+    }
+
+    #[test]
     fn a_blank_tensor_yields_no_detections() {
         // The "the model saw nothing" case, and the one a real blank frame must
         // reach: `blank_row` is objectness -40, so every row scores ~2e-18 and
