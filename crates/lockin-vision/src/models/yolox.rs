@@ -49,9 +49,9 @@
 //! order (`Concat(['1146', '1148', '1149'])` for the stride-32 branch and its
 //! two siblings).
 //!
-//! # R38: what the graph activates, and what that costs
+//! # R38: what the graph activates — and the two errors it exposed
 //!
-//! **The brief says "fully raw with no sigmoid in the graph". The graph has 110
+//! **The brief said "fully raw with no sigmoid in the graph". The graph has 110
 //! `Sigmoid` nodes, and `obj` and `cls` are behind them.** Only `xy` and `wh`
 //! leave the graph un-activated. Measured, not inferred:
 //!
@@ -61,63 +61,67 @@
 //! | `obj` (1ch) | `Conv → Sigmoid` | **already σ** |
 //! | `cls` (80ch) | `Conv → Sigmoid` | **already σ** |
 //!
-//! So the decode in the brief — `score = sigmoid(obj) * sigmoid(cls)` — applies
-//! a **second** sigmoid to both terms. That is not a free no-op:
+//! So the brief's `score = sigmoid(obj) * sigmoid(cls)` was a **second**
+//! activation. `sigmoid` maps `[0, 1]` into `[0.5, 0.731]`, so the score was
+//! compressed into `[0.25, 0.534]` and could never exceed 0.534 — which is why
+//! the brief's `score_thr = 0.1` rejected nothing at all (all 3549 rows
+//! survived, 1624 boxes survived NMS). The decode is now `score = obj * cls`,
+//! taken raw from the graph. Per-row *class selection* was never affected,
+//! because `sigmoid` is monotone.
 //!
-//! * `sigmoid` maps `[0, 1]` into `[0.5, 0.731]`, so the score is compressed
-//!   into `[0.25, 0.534]` and can **never exceed 0.534**. The brief's
-//!   `score_thr = 0.1` therefore rejects nothing: measured on a COCO image,
-//!   all 3549 rows survive the threshold and 1624 boxes survive NMS.
-//! * Per-row *class selection* is unaffected — `sigmoid` is monotone, so the
-//!   argmax over classes is the same either way — and the decoded *boxes* are
-//!   unaffected, since `xy`/`wh` are genuinely raw.
+//! ## R39: the "degenerate `obj` head" was our preprocessing, not the export
 //!
-//! This module implements the brief's formula **as specified**, because the
-//! interface is Task 12's contract and a wrapper must not silently redefine the
-//! numbers its consumer was written against. Two consequences are recorded here
-//! so that whoever tunes Task 12 does not have to rediscover them:
+//! The first version of this module concluded, and reported, that the export's
+//! objectness head was **broken**: after the graph's own sigmoid it never
+//! exceeded 0.0107 on three COCO images, which looked like a head that had been
+//! zeroed during export. Its weights were present and non-zero, which was taken
+//! as corroboration.
 //!
-//! * the score ceiling is 0.534, so no threshold below it filters anything;
-//! * the column layout is `[cx, cy, w, h, obj, cls_0 … cls_79]` with `cls`
-//!   already a probability, so switching to `obj * cls` needs no other edit.
+//! **That conclusion was wrong, and the evidence for it was never sufficient.**
+//! "The weights are non-zero" rules out a missing tensor; it does not rule out
+//! the input being deformed. The brief's ImageNet mean and std are a
+//! *convention* the graph does not state, so reading the graph cannot verify
+//! them — and a wrong convention deforms the input in a way that leaves `cls`
+//! and `bbox` looking entirely plausible.
 //!
-//! ## The `obj` head is degenerate in this export, and that is not this
-//! ## module's bug
+//! Testing the plausible conventions against each other settled it. **Only raw
+//! `0–255` produces a healthy `obj` distribution**:
 //!
-//! Run on three COCO val images, the `obj` head — *after* the graph's own
-//! `Sigmoid` — never exceeds **0.0107**, with a mean of 8.96e-05 and a 99th
-//! percentile of 2.47e-03. A working objectness head puts confident rows near
-//! 0.9. Its weights are present and non-zero (`Conv` `623` is
-//! `[1, 64, 1, 1]`, |W| min 9.5e-04, std 0.21, bias −0.130; `619` bias −2.16),
-//! so nothing is missing — the head simply outputs ≈0 for everything.
+//! | input convention | `obj` max (3 images) | detections at 0.25 |
+//! |---|---|---|
+//! | **raw 0–255 — adopted** | **0.893 / 0.997 / 0.994** | **3 / 1 / 9** |
+//! | the brief's mean/std | 0.011 / 0.005 / 0.003 | 0 / 0 / 0 |
+//! | RGB instead of BGR | 0.010 / 0.006 / 0.002 | — |
+//! | `/255`, no mean | 0.0003 / 0.0002 / 0.0003 | — |
+//! | mean/std, pad 0 instead of 114 | 0.008 / 0.006 / 0.004 | — |
 //!
-//! Which means `sigmoid(≈0) ≈ 0.5`: the brief's first factor is a **constant
-//! 0.5** on real input, every row scores ≈ half its class probability, and the
-//! 0.1 floor is unreachable in the other direction too. Both error modes of a
-//! broken `objectness` — flood and silence — are present at once, and no
-//! arithmetic in this file can fix either. This wrapper's job is to be exactly
-//! as correct as the model allows and to say so; `preprocess`, `decode_row` and
-//! [`YoloxNano::detect`] are each verified against the graph above and against
-//! the COCO images in `research/yolox/`.
+//! The `obj` tail comes back by **93x** under the raw scale, and every variant
+//! that standardises the input collapses it to ~0.005 *regardless of colour
+//! order or pad value* — so the fault is the standardisation itself and not any
+//! neighbouring choice. Under the brief's regime the detector returned **no
+//! boxes at all** on all three images; under the raw scale it frames the
+//! television, the chairs, the dining table and a person in a room, and two cats
+//! and a sofa in another. See [`preprocess`] for the table and
+//! `research/yolox/diagnose_preprocessing.py` for the measurement.
 //!
-//! The class head is *not* degenerate: its logits reach 0.76 on the same image,
-//! and the classes it picks are the right ones — `person` and `cat` on a photo
-//! of two cats on a sofa. The boxes are sane as well: `w`/`h` in log space sit
-//! at 1.15–1.42, which is boxes of three to four cells. Only `obj` is broken,
-//! and a caller that wants to work around it can rank by the class probability
-//! alone.
+//! This is the second time in this task that a plausible-looking output hid a
+//! total failure, and it is the reason the preprocessing regime has its own
+//! literal-valued test: see [`preprocess`].
 //!
 //! # Preprocessing is this model's own, and is not shared
 //!
-//! BGR, `0–255` with **no** division, letterboxed to a 32-multiple at 416×416
-//! with pad value **114**, then `(x - mean) / std` with mean
-//! `[103.53, 116.28, 123.675]` and std `[57.375, 57.12, 58.395]`. All four
-//! parts differ from every other wrapper in this crate and none of them may be
-//! folded into a shared helper: YuNet letterboxes and scales by `1/255` with no
-//! mean, Face Mesh reverses to RGB and scales by `1/255` with no mean, and the
-//! eye classifier subtracts 127 and divides by 255 to a square with no
-//! letterbox at all. The `114` is YOLOX's own padding constant, not a grey
-//! derived from the mean.
+//! BGR, **raw `0–255`** with no division **and no mean or std**, letterboxed to a
+//! 32-multiple at 416×416 with pad value **114**. All four parts differ from
+//! every other wrapper in this crate and none may be folded into a shared
+//! helper: YuNet letterboxes and scales by `1/255` with no mean, Face Mesh
+//! reverses to RGB and scales by `1/255` with no mean, and the eye classifier
+//! subtracts 127 and divides by 255 to a square with no letterbox at all.
+//!
+//! The `114` is downstream evidence for the raw regime: it is meaningful as a
+//! *pixel value* between 0 and 255, and meaningless as a standardised
+//! coordinate. The official YOLOX `preprocess.py` again has `color_aug`,
+//! `mosaic` and `mixup` options and **no mean/std option at all**, and no
+//! `--mean`/`--std` flag exists in the repository's `exps/` or `tools/`.
 
 use crate::analyze::nms::{Detection, Rect, nms};
 use crate::frame::Frame;
@@ -179,17 +183,20 @@ pub const PERSON_CLASS: u32 = 0;
 /// channel this crate names.
 pub const CELL_PHONE_CLASS: u32 = 67;
 
-/// The per-channel mean subtracted from the 0–255 BGR pixel.
-const MEAN: [f32; CHANNELS] = [103.53, 116.28, 123.675];
-
-/// The per-channel standard deviation divided out after the mean.
-const STD: [f32; CHANNELS] = [57.375, 57.12, 58.395];
+// There are deliberately **no `MEAN` and `STD` constants here.** The brief
+// specified ImageNet mean `[103.53, 116.28, 123.675]` and std
+// `[57.375, 57.12, 58.395]`, and subtracting them was wrong — see
+// [`preprocess`] for the measurement that settled it.
 
 /// IoU above which two boxes of the same class suppress each other.
 const NMS_IOU_THRESHOLD: f32 = 0.45;
 
 /// Score below which a row is not a detection at all.
-const SCORE_THRESHOLD: f32 = 0.1;
+///
+/// `0.25` — YOLOX's own default `--nms 0.45 --conf 0.25`. See [`YoloxNano::detect`]
+/// for the measurement, and for what the number means given that the graph has
+/// already applied its sigmoids.
+const SCORE_THRESHOLD: f32 = 0.25;
 
 /// The exponent a raw width or height is clamped to, in both directions.
 ///
@@ -367,12 +374,6 @@ fn remap(index: f32, scale: f32) -> f32 {
     (index + 0.5) / scale - 0.5
 }
 
-/// One BGR byte scaled the way this graph was trained: `(x - mean) / std`.
-#[inline]
-fn normalise(channel: usize, value: f32) -> f32 {
-    (value - MEAN[channel]) / STD[channel]
-}
-
 /// Bilinear blue-green-red sample at a floating-point frame coordinate.
 ///
 /// Coordinates outside the frame clamp to the edge pixel, so the sampler can
@@ -437,25 +438,65 @@ fn sample_bgr(frame: &Frame, x: f32, y: f32) -> (f32, f32, f32) {
 /// the scaled size is rounded **down to a multiple of 32**, and the remainder
 /// is filled with `PAD_VALUE`.
 ///
-/// Three parts of this are load-bearing and none is cosmetic:
+/// # The input is raw `0–255`. There is no mean and no std, and that is a fix
 ///
-/// * **No division by 255.** The values stay on `0–255` and are then standardised
-///   by the mean and std below. Dividing first puts the whole tensor ~255x too
-///   small and the detector returns nothing.
-/// * **BGR, not RGB.** Reversing the channels is Face Mesh's regime.
+/// The brief specified ImageNet mean `[103.53, 116.28, 123.675]` and std
+/// `[57.375, 57.12, 58.395]`. **Subtracting them was wrong, and it silently
+/// destroyed the detector.** Measured on three COCO val images, five candidate
+/// conventions, `obj` taken *after* the graph's own sigmoid:
+///
+/// | input convention | `obj` max | detections at 0.25 |
+/// |---|---|---|
+/// | **raw 0–255 (this one)** | **0.893 / 0.997 / 0.994** | **3 / 1 / 9** |
+/// | the brief's mean/std | 0.011 / 0.005 / 0.003 | 0 / 0 / 0 |
+/// | RGB instead of BGR | 0.010 / 0.006 / 0.002 | — |
+/// | `/255`, no mean | 0.0003 / 0.0002 / 0.0003 | — |
+/// | mean/std with pad 0 | 0.008 / 0.006 / 0.004 | — |
+///
+/// A healthy objectness head has a long right tail towards 1.0. Only the raw
+/// scale produces one, and it does so by **93x**. Every variant that
+/// standardises the input collapses `obj` to ~0.005 regardless of colour order
+/// or pad value, so the fault is the standardisation itself and not any of the
+/// neighbouring choices.
+///
+/// The failure mode is the one this whole task is about: the deformed input
+/// still produced a *plausible-looking* `cls` (max 0.76, correct argmax classes)
+/// and plausible `bbox` values, so nothing looked broken — while `obj` sat at
+/// 0.005 and the detector returned **no boxes at all**. A reviewer reading only
+/// shapes and class names would have passed it.
+///
+/// The raw regime is also what YOLOX itself documents: the official
+/// `yolox/data/datasets/preprocess.py` has thorough `color_aug`, `mosaic` and
+/// `mixup` options and **no mean/std option at all**, and no `--mean`/`--std`
+/// flag exists anywhere in the repository's `exps/` or `tools/`. The value of
+/// `PAD_VALUE` of 114 is downstream evidence for the same conclusion: 114 is
+/// meaningful as a *pixel value* between 0 and 255, and meaningless as a
+/// standardised coordinate.
+///
+/// # The three parts that are load-bearing
+///
+/// * **Raw `0–255`, no `/255`.** Dividing scales the tensor ~255x too small and
+///   collapses `obj` to 0.0003, which is worse than the mean/std error.
+/// * **BGR, not RGB.** Reversing the channels is Face Mesh's regime; here it
+///   costs the objectness head its tail too (0.010 vs 0.893).
 /// * **Pad 114**, at the bottom and right, not centred.
+///
+/// # R39: this needed a test that could see it
+///
+/// The unit tests could not have caught it. Every one of them feeds a **fake
+/// session** and asserts on the tensor *this function builds* — so a wrong
+/// convention is compared against expectations written from the same wrong
+/// convention, and the suite is green. What a test *can* pin is the regime
+/// itself, as literals: [`preprocess`] keeps a test asserting that a byte of 10
+/// reaches the tensor as **10.0** and not as `(10 - 103.53) / 57.375`. That is
+/// the regression guard, and it is the only kind available without a model file
+/// in the test binary.
 pub fn preprocess(frame: &Frame) -> InputTensor {
     let plane = INPUT_SIZE * INPUT_SIZE;
-    // The pad pixel is *normalised*, once, exactly like every content pixel.
-    // Filling with a raw 114 and normalising only the content would put two
-    // regimes in one tensor: the graph would see a content band on `0-255`'s
-    // scale and a pad band on a scale 57x larger, and the border it was trained
-    // to ignore would become the brightest thing in the image.
-    let mut data = vec![0.0f32; plane * CHANNELS];
-    for channel in 0..CHANNELS {
-        let pad = normalise(channel, PAD_VALUE);
-        data[channel * plane..(channel + 1) * plane].fill(pad);
-    }
+    // The pad is the raw 114, because every other value in this tensor is raw
+    // 0-255 too. It is not normalised, and there is no normalisation to apply:
+    // see above.
+    let mut data = vec![PAD_VALUE; plane * CHANNELS];
 
     let letterbox = Letterbox::for_frame(frame.width, frame.height);
     let content_w = content_span(frame.width, letterbox.scale);
@@ -480,9 +521,9 @@ pub fn preprocess(frame: &Frame) -> InputTensor {
             let source_y = remap(tensor_y, letterbox.scale);
             let (b, g, r) = sample_bgr(frame, source_x, source_y);
             let index = row * INPUT_SIZE + column;
-            data[index] = normalise(0, b);
-            data[plane + index] = normalise(1, g);
-            data[2 * plane + index] = normalise(2, r);
+            data[index] = b;
+            data[plane + index] = g;
+            data[2 * plane + index] = r;
         }
     }
 
@@ -514,17 +555,15 @@ fn finite_raw(value: f32) -> f32 {
 /// One row's box in **tensor** coordinates, or `None` if the row scored below
 /// [`SCORE_THRESHOLD`] or its best class is not one of `wanted`.
 ///
-/// This is the decode the brief specifies, and for this export it applies a
-/// second sigmoid to two already-activated heads — see R38 in the module docs
-/// for the measurement and for what it costs. It is implemented as written
-/// because the score is Task 12's input contract, not this wrapper's to
-/// redefine.
+/// The decode, per the brief's arithmetic with one correction: `score` is
+/// `obj * cls` and not `sigmoid(obj) * sigmoid(cls)`, because the graph has
+/// already applied both sigmoids (R38 in the module docs). The rest is as
+/// specified — `xy = (raw[0..2] + grid) * stride`, `wh = exp(raw[2..4]) * stride`.
 ///
-/// Every arithmetic step is total: `raw` is sanitised by [`finite_raw`], the
-/// exponent is clamped to `±MAX_EXPONENT`, and `sigmoid` is the numerics-safe
-/// form rather than `1 / (1 + exp(-x))`, which overflows to `inf` and then
-/// gives `1 / inf = 0` for large negative logits — a wrong answer that looks
-/// like a confident rejection.
+/// Every arithmetic step is total: `raw` is sanitised by [`finite_raw`], and
+/// the exponent and the origin are both clamped. This wrapper owns no activation
+/// of its own, so there is no `sigmoid` here to make total — the one the brief
+/// asked for is gone.
 fn decode_row(raw: &[f32], row: usize, wanted: &[u32]) -> Option<Detection> {
     if raw.len() < COLUMNS {
         return None;
@@ -590,15 +629,20 @@ fn decode_row(raw: &[f32], row: usize, wanted: &[u32]) -> Option<Detection> {
         return None;
     }
 
-    let objectness = finite_raw(raw[4]);
-    let class_score = finite_raw(raw[5 + class]);
-    let score = sigmoid(objectness) * sigmoid(class_score);
+    // `score = obj * cls`, both taken straight from the graph, which has
+    // **already applied its sigmoids to both**. See the module docs: the brief's
+    // `sigmoid(obj) * sigmoid(cls)` was a second activation, and it capped every
+    // score at 0.534.
+    //
+    // The two are already known finite — the checks above reject the row
+    // otherwise — so the product is finite too, and no clamp is needed here.
+    let score = finite_raw(raw[4]) * finite_raw(raw[5 + class]);
     // `!(score >= …)` rather than `score < …`, so that a NaN score is rejected
-    // here instead of passing a comparison that is false for it. The product of
-    // two finite sigmoids cannot be NaN, so this is belt and braces and costs
-    // one boolean — which is why the lint is silenced rather than the
-    // expression rewritten as a `partial_cmp` that would need its own `None`
-    // arm for a case that cannot occur.
+    // here instead of passing a comparison that is false for it. Two finite
+    // factors cannot produce a NaN, so this is belt and braces and costs one
+    // boolean — which is why the lint is silenced rather than the expression
+    // rewritten as a `partial_cmp` that would need its own `None` arm for a case
+    // that cannot occur.
     #[allow(clippy::neg_cmp_op_on_partial_ord)]
     if !(score >= SCORE_THRESHOLD) {
         return None;
@@ -624,23 +668,6 @@ fn decode_row(raw: &[f32], row: usize, wanted: &[u32]) -> Option<Detection> {
         score,
         class_id,
     })
-}
-
-/// `1 / (1 + e^-x)`, spelled so that neither tail overflows.
-///
-/// The textbook form computes `e^-x`, which is `inf` for `x < -88.7`; `1 / inf`
-/// is then `0.0`, which is the right limit reached by an infinity rather than
-/// by arithmetic. The two-branch form below keeps every intermediate finite in
-/// both directions, which is what the crate's no-NaN rule asks of the one
-/// activation this wrapper owns.
-#[inline]
-fn sigmoid(x: f32) -> f32 {
-    if x >= 0.0 {
-        1.0 / (1.0 + (-x).exp())
-    } else {
-        let e = x.exp();
-        e / (1.0 + e)
-    }
 }
 
 /// The output tensor's `[1, N, 85]` rows, after checking its name, shape and
@@ -718,14 +745,48 @@ impl YoloxNano {
     /// boxes that corroborate it, `Detection`'s `class_id` is still carried so
     /// a caller can tell the two apart, and the other seventy-eight classes
     /// have no consumer in this engine. Returning them would push 78
-    /// irrelevant classes through Task 12's `PhoneSignal`, and — measured on a
-    /// COCO cat photo — `sheep` and `airplane` score *above* the real phone, so
-    /// an unfiltered result is not merely extra data, it is data that outranks
-    /// the answer. The filter is applied **before** NMS rather than after, so
-    /// that a strong `sheep` box cannot suppress a weaker overlapping `cat`
-    /// box that the caller was never going to see anyway; the two orderings
-    /// differ, and filtering first is the one whose output is a pure function
-    /// of the two classes the caller asked for.
+    /// irrelevant classes through Task 12's `PhoneSignal`, and the classes the
+    /// filter drops are not always the weaker ones, so an unfiltered result is
+    /// not merely extra data — it is data that can outrank the answer. The
+    /// filter is applied **before** NMS rather than after, so that a strong
+    /// dropped-class box cannot suppress a weaker overlapping one the caller was
+    /// never going to see anyway; the two orderings differ, and filtering first
+    /// is the one whose output is a pure function of the two classes the caller
+    /// asked for.
+    ///
+    /// # What `score` is, and why the threshold is 0.25
+    ///
+    /// `score = obj * cls`, with **both factors already sigmoid-activated by the
+    /// graph** — see R38 in the module docs. So `score` is a genuine
+    /// probability-like confidence on `[0, 1]`, and the threshold's meaning is
+    /// the ordinary one: *the joint probability that this cell holds an object
+    /// and that the object is of the claimed class*. With `obj` and `cls`
+    /// independent, `score >= 0.25` is roughly "both are at least moderate" —
+    /// e.g. `obj 0.5, cls 0.5`, or `obj 0.9, cls 0.28`.
+    ///
+    /// `0.25` is YOLOX's own default (`--conf 0.25`), and it is where the
+    /// measured detections sit: on three COCO val images the corrected pipeline
+    /// returns **3 / 1 / 9** boxes after NMS at 0.25, all of them objects that
+    /// are visibly present (two cats and a sofa; a figure; a television, three
+    /// chairs, a dining table, a person, a clock). The sweep below is the
+    /// evidence for the value, and the honesty about it:
+    ///
+    /// | threshold | rows past it (3 images) | after NMS |
+    /// |---|---|---|
+    /// | 0.05 | 222 | 44 |
+    /// | 0.10 | 149 | 26 |
+    /// | 0.20 | 105 | 15 |
+    /// | **0.25** | **98** | **13** |
+    /// | 0.30 | 89 | 11 |
+    /// | 0.50 | 55 | 9 |
+    ///
+    /// **I cannot claim a measured precision for this number**, because the
+    /// three images have no ground-truth labels. What was checked is that every
+    /// surviving box corresponds to an object visible in the frame — done by
+    /// drawing the boxes and looking at them
+    /// (`research/yolox/compare_variants.py` writes the overlays). Above 0.25 the
+    /// count falls slowly, which says the real detections have a long tail rather
+    /// than a clean gap; below it the count grows quickly with small boxes.
     ///
     /// # What the boxes mean
     ///
@@ -840,21 +901,26 @@ mod tests {
     }
 
     /// A row that decodes to something worthless: a central grid cell, a
-    /// sub-pixel box, `sigmoid(-40)` objectness.
+    /// sub-pixel box, **zero objectness**.
     ///
-    /// `sigmoid(-40) = 4.25e-18`, so the row's score is ~2.1e-18 — far below
-    /// `SCORE_THRESHOLD` and below anything a real head emits. Filling the
-    /// background with this instead of zeroes matters: a zeroed row has
-    /// `sigmoid(0) = 0.5` objectness and `sigmoid(0) = 0.5` for *every* class,
-    /// which is a score of 0.25 — comfortably above threshold, and 3549
-    /// spurious detections from a tensor a test thought was empty.
+    /// A zero objectness dominates the score to zero whatever the class logits
+    /// say — `score = obj * cls` and `cls` is a probability — so this row can
+    /// never clear `SCORE_THRESHOLD` from the class side. That is why the
+    /// background is a zeroed objectness rather than a very negative *logit*:
+    /// under the corrected formula the objectness column is already a
+    /// probability, and a multiplicative zero is stronger than any additive
+    /// logit could be.
     fn blank_row() -> [f32; COLUMNS] {
-        let mut row = [0.0f32; COLUMNS];
-        row[4] = -40.0;
-        row
+        [0.0f32; COLUMNS]
     }
 
     // A row configured for `class_id` at `objectness` and `class_score`.
+    //
+    // **Both are probabilities, not logits.** The graph has already applied its
+    // sigmoids, so the tensor's `obj` and `cls` columns are on `[0, 1]` and the
+    // decode multiplies them directly. Passing a logit here would silently mean
+    // something different from what it looks like — the mistake this file's
+    // history is made of — so the parameters are named for what they are.
     //
     // The single place the column layout `[cx, cy, w, h, obj, cls_*]` is
     // written down for the tests: every other helper builds its rows from this
@@ -897,19 +963,20 @@ mod tests {
     }
 
     /// A tensor whose **row `row`** is configured for `class_id` at
-    /// `objectness_logit` and `class_logit`, with everything else blank.
+    /// `objectness` and `class_score` — both probabilities, see [`row_for`] —
+    /// with everything else blank.
     fn tensor_with_one_row(
         row: usize,
-        objectness_logit: f32,
+        objectness: f32,
         class_id: usize,
-        class_logit: f32,
+        class_score: f32,
         box_raw: [f32; 4],
     ) -> Vec<f32> {
         let mut raw = blank_predictions();
         set_row(
             &mut raw,
             row,
-            &row_for(objectness_logit, class_id, class_logit, box_raw),
+            &row_for(objectness, class_id, class_score, box_raw),
         );
         raw
     }
@@ -1006,13 +1073,14 @@ mod tests {
             "224 is 32 x 7, so nothing is floored away"
         );
 
-        // Content: BGR in the graph's regime — 0-255 with NO division. A
-        // `/255` would put blue at 0.039216 and red at 0.117647, so the three
-        // numbers below distinguish the two regimes as well as the channel
-        // order.
-        let blue = (10.0 - MEAN[0]) / STD[0];
-        let green = (20.0 - MEAN[1]) / STD[1];
-        let red = (30.0 - MEAN[2]) / STD[2];
+        // Content: BGR at **raw 0-255**. These four literals are the regression
+        // guard for R39, and they are the *only* kind of test that can be one:
+        // every other test here feeds a fake session and compares the tensor
+        // against expectations written from the same convention, so a wrong
+        // convention is invisible to them. The failure this pins cost the
+        // detector every detection it had, while `cls` and `bbox` still looked
+        // perfectly reasonable.
+        let (blue, green, red) = (10.0f32, 20.0f32, 30.0f32);
         for (column, row) in [(0, 0), (1, 1), (415, 0), (0, 223), (415, 223)] {
             assert_eq!(
                 at(&tensor, 0, column, row),
@@ -1026,39 +1094,39 @@ mod tests {
             );
             assert_eq!(at(&tensor, 2, column, row), red, "red at ({column},{row})");
         }
-        // Spelled out against the literals 10, 20 and 30, because the three
-        // `let`s above follow `MEAN` and `STD` and would move with a mutation
-        // of either. This is the assertion that pins the regime itself:
-        // (10 - 103.53)/57.375 = -1.6301525, a bare 10/255 = 0.039216, and
-        // 10 with no normalisation at all = 10.
-        assert_eq!(blue, -1.6301525_f32, "0-255, centred on 103.53 and scaled");
-        assert_eq!(green, -1.6855743_f32, "not divided by 255");
-        assert_eq!(red, -1.6041614_f32, "and not left raw");
+        // The three regimes, spelled out as literals: raw 10 (correct), the
+        // brief's `(10 - 103.53)/57.375 = -1.6301525` (collapses `obj` to
+        // 0.011), and `10/255 = 0.039215688` (collapses it to 0.0003). A
+        // mutation to either wrong regime fails here, on the value itself.
+        assert_eq!(
+            blue, 10.0,
+            "raw 0-255: the byte reaches the graph as itself"
+        );
+        assert_ne!(
+            blue, -1.6301525_f32,
+            "not standardised by the brief's mean/std"
+        );
+        assert_ne!(blue, 10.0 / 255.0, "and not divided by 255");
+        assert_eq!(green, 20.0);
+        assert_eq!(red, 30.0);
 
-        // Padding: exactly the pad value, in all three channels, in every one
-        // of the 192 padded rows. The bottom-right corner is checked as well
-        // as the top of the pad band, so a partially-filled or transposed pad
-        // cannot pass.
-        let pad = (PAD_VALUE - MEAN[0]) / STD[0];
-        assert_eq!(at(&tensor, 0, 0, 224), pad, "the first pad row");
-        assert_eq!(at(&tensor, 1, 0, 224), (PAD_VALUE - MEAN[1]) / STD[1]);
-        assert_eq!(at(&tensor, 2, 0, 224), (PAD_VALUE - MEAN[2]) / STD[2]);
-        assert_eq!(at(&tensor, 0, 415, 415), pad, "and the last pad pixel");
-        assert_eq!(at(&tensor, 2, 415, 415), (PAD_VALUE - MEAN[2]) / STD[2]);
-        // The pad is 114, not 0 and not a grey: (114 - 103.53)/57.375 =
-        // 0.18248369, while a 0 pad reads -1.8044444 and a 127 pad reads
-        // 0.40906155.
-        assert_eq!(pad, 0.18248369_f32, "the pad value is 114, not 0 or 127");
+        // Padding: exactly the raw 114, in all three channels, in every one of
+        // the 192 padded rows. 114 in the raw regime sits *between* the content
+        // values — it is a mid grey — which is only meaningful because the
+        // tensor is on 0-255. It is the same evidence as above: a pad of 114 in
+        // a standardised tensor would be a meaningless coordinate.
+        assert_eq!(at(&tensor, 0, 0, 224), PAD_VALUE, "the first pad row");
+        assert_eq!(at(&tensor, 1, 0, 224), PAD_VALUE);
+        assert_eq!(at(&tensor, 2, 0, 224), PAD_VALUE);
         assert_eq!(
-            (PAD_VALUE - MEAN[1]) / STD[1],
-            -0.039915945_f32,
-            "and green's is its own mean, not blue's"
+            at(&tensor, 0, 415, 415),
+            PAD_VALUE,
+            "and the last pad pixel"
         );
-        assert_eq!(
-            (PAD_VALUE - MEAN[2]) / STD[2],
-            -0.16568205_f32,
-            "and red's is the third"
-        );
+        assert_eq!(at(&tensor, 2, 415, 415), PAD_VALUE);
+        assert_eq!(PAD_VALUE, 114.0, "the pad value is 114, not 0 and not 127");
+        assert_ne!(PAD_VALUE, 0.0);
+        assert_ne!(PAD_VALUE, 127.0);
 
         // The whole pad band, every pixel: a loop that stopped at the pad's
         // first row, or that wrote content into part of it, leaves values the
@@ -1070,11 +1138,7 @@ mod tests {
                 let plane = INPUT_SIZE * INPUT_SIZE;
                 assert_eq!(
                     [got[0], got[plane], got[2 * plane]],
-                    [
-                        (PAD_VALUE - MEAN[0]) / STD[0],
-                        (PAD_VALUE - MEAN[1]) / STD[1],
-                        (PAD_VALUE - MEAN[2]) / STD[2],
-                    ],
+                    [PAD_VALUE; CHANNELS],
                     "pad pixel ({column}, {row})"
                 );
             }
@@ -1094,11 +1158,13 @@ mod tests {
         //   x   = 384 - 4.8522453 / 2 = 381.57388
         //   y   =   8 - 2.9430356 / 2 =   6.5284822
         //
-        // and the score is `sigmoid(0) * sigmoid(0) = 0.5 * 0.5 = 0.25`, exact
-        // in f32 because 0.5 is a power of two.
+        // and the score is `obj * cls` with both already sigmoid-activated by
+        // the graph: `0.5 * 0.5 = 0.25`, exact in f32 because 0.5 is a power of
+        // two — and exactly `SCORE_THRESHOLD`, which the comparison admits
+        // because it drops what falls *below* the threshold.
         let frame = letterboxed_frame((10, 20, 30));
         let row = 100;
-        let raw = tensor_with_one_row(row, 0.0, PERSON_CLASS as usize, 0.0, [0.0, 0.0, -0.5, -1.0]);
+        let raw = tensor_with_one_row(row, 0.5, PERSON_CLASS as usize, 0.5, [0.0, 0.0, -0.5, -1.0]);
         let (detector, _) = detector_returning(predictions_output(raw));
 
         let detections = detector.detect(&frame).expect("a well-formed output");
@@ -1106,10 +1172,7 @@ mod tests {
         let detection = detections[0];
 
         assert_eq!(detection.class_id, PERSON_CLASS);
-        assert_eq!(
-            detection.score, 0.25,
-            "sigmoid(0) * sigmoid(0) is exactly 0.25"
-        );
+        assert_eq!(detection.score, 0.25, "0.5 * 0.5 is exactly 0.25");
 
         // The frame is 1664x832 and the letterbox scale is 0.25 with no
         // offset, so frame = tensor / 0.25 = tensor * 4. Every expected value
@@ -1191,7 +1254,7 @@ mod tests {
                 [f32::INFINITY, f32::NEG_INFINITY, 1.0, 1.0],
             ),
         ] {
-            let raw = tensor_with_one_row(0, 0.0, PERSON_CLASS as usize, 0.0, box_raw);
+            let raw = tensor_with_one_row(0, 0.5, PERSON_CLASS as usize, 0.5, box_raw);
             let (detector, _) = detector_returning(predictions_output(raw));
             let detections = detector
                 .detect(&frame)
@@ -1208,7 +1271,7 @@ mod tests {
         // would otherwise pass silently through `finite_raw` as
         // `sigmoid(-MAX_EXPONENT)` = 2.06e-9.
         let (detector, _) =
-            detector_for_row(0, &row_for(0.0, PERSON_CLASS as usize, f32::NAN, [0.0; 4]));
+            detector_for_row(0, &row_for(0.5, PERSON_CLASS as usize, f32::NAN, [0.0; 4]));
         assert!(
             detector
                 .detect(&frame)
@@ -1219,7 +1282,7 @@ mod tests {
 
         // And a non-finite *objectness* is rejected for the same reason.
         let (detector, _) =
-            detector_for_row(0, &row_for(f32::NAN, PERSON_CLASS as usize, 0.0, [0.0; 4]));
+            detector_for_row(0, &row_for(f32::NAN, PERSON_CLASS as usize, 0.5, [0.0; 4]));
         assert!(
             detector
                 .detect(&frame)
@@ -1237,7 +1300,7 @@ mod tests {
             ("an enormous positive width", [0.0, 0.0, 1.0e30, 1.0e30]),
             ("an enormous negative height", [0.0, 0.0, -1.0e30, -1.0e30]),
         ] {
-            let raw = tensor_with_one_row(0, 0.0, PERSON_CLASS as usize, 0.0, box_raw);
+            let raw = tensor_with_one_row(0, 0.5, PERSON_CLASS as usize, 0.5, box_raw);
             let (detector, _) = detector_returning(predictions_output(raw));
             let detections = detector
                 .detect(&frame)
@@ -1278,7 +1341,7 @@ mod tests {
                 [f32::MAX, f32::MIN, f32::MAX, f32::MIN],
             ),
         ] {
-            let raw = tensor_with_one_row(0, 0.0, PERSON_CLASS as usize, 0.0, box_raw);
+            let raw = tensor_with_one_row(0, 0.5, PERSON_CLASS as usize, 0.5, box_raw);
             let (detector, _) = detector_returning(predictions_output(raw));
             let detections = detector
                 .detect(&frame)
@@ -1307,9 +1370,9 @@ mod tests {
 
         let raw = tensor_with_one_row(
             0,
-            0.0,
+            0.5,
             PERSON_CLASS as usize,
-            0.0,
+            0.5,
             [0.0, 0.0, 1.0e30, 1.0e30],
         );
         let (detector, _) = detector_returning(predictions_output(raw));
@@ -1336,25 +1399,21 @@ mod tests {
         let mut raw = blank_predictions();
 
         // Rows 0..3 are the classes the engine does not consume, and they are
-        // given *higher* logits than the two that it does — 0.9 against 0.8 —
-        // so that a wrapper which simply returned the strongest rows, or which
-        // filtered after NMS on some other criterion, cannot pass.
+        // given *higher* class scores than the two that it does — 1.0 against
+        // 0.75 — so that a wrapper which simply returned the strongest rows, or
+        // which filtered after NMS on some other criterion, cannot pass.
         for (row, class_id) in [(0, 18), (1, 66), (2, 65), (3, 68)] {
-            set_row(
-                &mut raw,
-                row,
-                &row_for(0.0, class_id, 2.197_224_6, [0.0; 4]),
-            );
+            set_row(&mut raw, row, &row_for(0.5, class_id, 1.0, [0.0; 4]));
         }
         set_row(
             &mut raw,
             100,
-            &row_for(0.0, PERSON_CLASS as usize, 1.386_294_4, [0.0; 4]),
+            &row_for(0.5, PERSON_CLASS as usize, 0.75, [0.0; 4]),
         );
         set_row(
             &mut raw,
             2704,
-            &row_for(0.0, CELL_PHONE_CLASS as usize, 1.386_294_4, [0.0; 4]),
+            &row_for(0.5, CELL_PHONE_CLASS as usize, 0.75, [0.0; 4]),
         );
 
         let (detector, _) = detector_returning(predictions_output(raw));
@@ -1370,24 +1429,18 @@ mod tests {
         );
         // The scores are the *configured* rows' and not the strongest in the
         // tensor. This is what separates "filtered by class" from "filtered by
-        // score": the four dropped rows carry class logit 2.197 (σ = 0.9) and
-        // the two kept rows 1.386 (σ = 0.8), so a wrapper that sorted by score
-        // and took the top two would have returned class 18 and class 66 here.
+        // score": the four dropped rows score `0.5 * 1.0 = 0.5` and the two kept
+        // rows `0.5 * 0.75 = 0.375`, so a wrapper that sorted by score and took
+        // the top two would have returned class 18 and class 66 here.
         //
-        // The assertion is a *bound* and not `== 0.4`, deliberately: an equality
-        // against the brief's own expression would fail on a correct change to
-        // `obj * cls` and prove nothing about which row was chosen. The
-        // comparison against the dropped rows' score is the part that has teeth.
-        let dropped_score = 0.5 * 0.9;
+        // Every number is an exact binary fraction, so these are equalities with
+        // no rounding to hide behind. The comparison against the dropped rows'
+        // score is the part with teeth.
+        let dropped_score = 0.5 * 1.0;
+        assert_eq!(dropped_score, 0.5, "an exact product");
         assert_eq!(
-            dropped_score, 0.45,
-            "sigmoid(0) * sigmoid(2.197) is exactly 0.45 — exact because \
-             sigmoid(0) is a power of two"
-        );
-        assert!(
-            detections[0].score > 0.39 && detections[0].score < 0.41,
-            "the kept row scored {}",
-            detections[0].score
+            detections[0].score, 0.375,
+            "0.5 * 0.75, exactly — and above the 0.25 threshold"
         );
         assert!(
             detections[0].score < dropped_score,
@@ -1398,7 +1451,7 @@ mod tests {
         );
         assert_eq!(
             detections[0].score, detections[1].score,
-            "both kept rows were given the same configured logits"
+            "both kept rows were given the same configured scores"
         );
         assert_eq!(
             detections[1].class_id, 67,
@@ -1434,7 +1487,7 @@ mod tests {
         // and `left` is zero. This frame therefore cannot distinguish the two
         // offsets on its own, which is why the rest of this test covers the
         // other padding axis and the padding band's boundary.
-        let raw = tensor_with_one_row(106, 0.0, PERSON_CLASS as usize, 0.0, [0.0, 0.0, 0.0, 0.0]);
+        let raw = tensor_with_one_row(106, 0.5, PERSON_CLASS as usize, 0.5, [0.0, 0.0, 0.0, 0.0]);
         let (detector, _) = detector_returning(predictions_output(raw));
         let detections = detector.detect(&frame).expect("a well-formed output");
         assert_eq!(detections.len(), 1);
@@ -1475,9 +1528,9 @@ mod tests {
         assert_eq!(Letterbox::for_frame(square.width, square.height).scale, 1.0);
         let (detector, _) = detector_returning(predictions_output(tensor_with_one_row(
             106,
-            0.0,
+            0.5,
             PERSON_CLASS as usize,
-            0.0,
+            0.5,
             [0.0, 0.0, 0.0, 0.0],
         )));
         let detections = detector.detect(&square).expect("a well-formed output");
@@ -1528,9 +1581,9 @@ mod tests {
         // centre.
         let (detector, _) = detector_returning(predictions_output(tensor_with_one_row(
             2704,
-            0.0,
+            0.5,
             PERSON_CLASS as usize,
-            0.0,
+            0.5,
             [0.0, 0.0, 0.0, 0.0],
         )));
         let detections = detector.detect(&tall).expect("a well-formed output");
@@ -1704,26 +1757,25 @@ mod tests {
         //   IoU          = 1536 / 3072 = 0.5
         //
         // which is above the 0.45 threshold, so the weaker of the two must go.
+        //
+        // **Both boxes must clear `SCORE_THRESHOLD`**, or the score filter and
+        // not NMS would be doing the work and this test would pass with the
+        // threshold set to anything. Both take objectness 0.5, and their class
+        // scores are 0.75 and 0.5, so the scores are 0.375 and 0.25 — both at or
+        // above the threshold, and different, so the survivor is decided by
+        // score rather than by row order.
         const LN_3: f32 = 1.098_612_3;
         let frame = letterboxed_frame((10, 20, 30));
         let mut raw = blank_predictions();
         set_row(
             &mut raw,
             2704,
-            &row_for(0.0, PERSON_CLASS as usize, 0.0, [0.0, 0.0, LN_3, LN_3]),
+            &row_for(0.5, PERSON_CLASS as usize, 0.75, [0.0, 0.0, LN_3, LN_3]),
         );
-        // The second box is weaker, so which one survives is decided by score
-        // and not by row order: logit -1.386 is a class score of 0.2 against the
-        // first row's 0.5, so the first row's 0.25 beats this row's 0.1.
         set_row(
             &mut raw,
             2705,
-            &row_for(
-                0.0,
-                PERSON_CLASS as usize,
-                -1.386_294_4,
-                [0.0, 0.0, LN_3, LN_3],
-            ),
+            &row_for(0.5, PERSON_CLASS as usize, 0.5, [0.0, 0.0, LN_3, LN_3]),
         );
         let (detector, _) = detector_returning(predictions_output(raw));
         let detections = detector.detect(&frame).expect("a well-formed output");
@@ -1733,9 +1785,16 @@ mod tests {
             1,
             "an IoU of 0.5 is above the 0.45 threshold, so one box must go: {detections:?}"
         );
+        assert!(
+            detections[0].score > SCORE_THRESHOLD,
+            "the survivor is the stronger of the two and not the second row — \
+             whose 0.25 also cleared the threshold, so NMS is what removed it: \
+             got {}",
+            detections[0].score
+        );
         assert_eq!(
-            detections[0].score, 0.25,
-            "and the survivor is the stronger of the two, not the second row"
+            detections[0].score, 0.375,
+            "and its score is the first row's 0.5 * 0.75"
         );
 
         // The boxes really were 0.5 apart: `Rect::iou` on the two tensors the
@@ -1790,21 +1849,33 @@ mod tests {
         // therefore well above the 0.45 threshold, and the *only* reason both
         // survive is that they are different classes.
         //
-        // The two scores are equal by construction — same objectness 0, same
-        // class logit — so neither sorts above the other and the order cannot
-        // hide one behind the other.
-        const LOGIT: f32 = 2.197_224_6; // sigmoid = 0.9
+        // The two scores are equal by construction — same objectness, same class
+        // score — so neither sorts above the other and the order cannot hide one
+        // behind the other. Both clear the threshold, so NMS is what is under
+        // test and not the score filter.
+        const OBJECTNESS: f32 = 0.5;
+        const CLASS_SCORE: f32 = 0.9; // 0.5 * 0.9 = 0.45, above threshold
         let frame = letterboxed_frame((10, 20, 30));
         let mut raw = blank_predictions();
         set_row(
             &mut raw,
             0,
-            &row_for(0.0, PERSON_CLASS as usize, LOGIT, [0.0, 0.0, 4.0, 4.0]),
+            &row_for(
+                OBJECTNESS,
+                PERSON_CLASS as usize,
+                CLASS_SCORE,
+                [0.0, 0.0, 4.0, 4.0],
+            ),
         );
         set_row(
             &mut raw,
             1,
-            &row_for(0.0, CELL_PHONE_CLASS as usize, LOGIT, [0.0, 0.0, 4.0, 4.0]),
+            &row_for(
+                OBJECTNESS,
+                CELL_PHONE_CLASS as usize,
+                CLASS_SCORE,
+                [0.0, 0.0, 4.0, 4.0],
+            ),
         );
 
         let (detector, _) = detector_returning(predictions_output(raw));
@@ -1837,48 +1908,62 @@ mod tests {
     }
 
     #[test]
-    fn sigmoid_is_total_in_both_tails() {
-        // The score is this wrapper's own activation, and the textbook
-        // `1 / (1 + exp(-x))` overflows in the *negative* tail: `exp(88.8)` is
-        // `inf`, so `1 / inf` is `0.0`. That is the right limit reached by an
-        // infinity rather than by arithmetic, and it is why the two-branch form
-        // is worth its extra line — but reading a NaN out of a garbage tensor is
-        // the failure this crate's rule forbids, and only an extreme input tells
-        // the two spellings apart.
-        for x in [
-            -1000.0f32,
-            -88.8,
-            -20.0,
-            -1.0,
-            0.0,
-            1.0,
-            20.0,
-            88.8,
-            1000.0,
-            f32::MIN,
-            f32::MAX,
+    fn the_score_is_the_product_of_two_probabilities() {
+        // `sigmoid_is_total_in_both_tails` used to live here. It is **deleted,
+        // not moved**: the wrapper no longer owns an activation. `obj` and `cls`
+        // arrive from the graph already sigmoid-activated, so `score = obj * cls`
+        // needs no `sigmoid` in Rust at all, and a test of a function that no
+        // longer exists would be a test of nothing. What replaces it is the
+        // property that actually matters to a consumer.
+        //
+        // The score is a product of two `[0, 1]` values, so it is a `[0, 1]`
+        // value — a confidence a caller can threshold directly, with no ceiling
+        // at 0.534 and no double-activation compression.
+        let frame = letterboxed_frame((10, 20, 30));
+        for (label, objectness, class_score) in [
+            ("both confident", 0.9f32, 0.9f32),
+            ("object only", 0.9, 0.1),
+            ("class only", 0.1, 0.9),
+            ("neither", 0.1, 0.1),
+            ("saturated", 1.0, 1.0),
+            ("zero objectness", 0.0, 1.0),
+            ("zero class", 1.0, 0.0),
         ] {
-            let p = sigmoid(x);
-            assert!(p.is_finite(), "sigmoid({x}) must be finite, got {p}");
-            assert!(
-                (0.0..=1.0).contains(&p),
-                "sigmoid({x}) must be a probability, got {p}"
+            let (detector, _) = detector_for_row(
+                0,
+                &row_for(objectness, PERSON_CLASS as usize, class_score, [0.0; 4]),
             );
+            let detections = detector.detect(&frame).expect("a well-formed output");
+            let expected = objectness * class_score;
+            if expected >= SCORE_THRESHOLD {
+                assert_eq!(detections.len(), 1, "{label}: should survive");
+                assert_eq!(detections[0].score, expected, "{label}: score");
+                assert!(
+                    (0.0..=1.0).contains(&detections[0].score),
+                    "{label}: the score is a probability, got {}",
+                    detections[0].score
+                );
+            } else {
+                assert!(
+                    detections.is_empty(),
+                    "{label}: {objectness} * {class_score} = {expected} is below \
+                     {SCORE_THRESHOLD} and must not be returned, got {:?}",
+                    detections[0].score
+                );
+            }
         }
-        // The limits, and the value that has to be exact for this file's own
-        // score expectations to be exact: `sigmoid(0)` is a power of two, so
-        // `0.5 * 0.5` is 0.25 with no rounding at all.
-        assert_eq!(sigmoid(0.0), 0.5);
-        assert_eq!(sigmoid(-1000.0), 0.0, "the negative tail reaches zero");
-        assert_eq!(sigmoid(1000.0), 1.0, "and the positive tail one");
-        assert!(
-            sigmoid(-88.8) > 0.0,
-            "reached by arithmetic, not by 1/inf: {}",
-            sigmoid(-88.8)
+
+        // The ceiling, asserted as a literal because it is the whole point of
+        // the fix: with both factors from the graph, the largest score is 1.0.
+        // Under the brief's double sigmoid it could not exceed 0.534, which is
+        // why nothing below that threshold filtered anything.
+        let (detector, _) =
+            detector_for_row(0, &row_for(1.0, PERSON_CLASS as usize, 1.0, [0.0; 4]));
+        assert_eq!(
+            detector.detect(&frame).expect("a well-formed output")[0].score,
+            1.0,
+            "the score can reach 1.0; it is not compressed into [0.25, 0.534]"
         );
-        // Monotone, which is what makes the class argmax unaffected by the
-        // second sigmoid the brief's score applies to an already-activated head.
-        assert!(sigmoid(-1.0) < sigmoid(0.0) && sigmoid(0.0) < sigmoid(1.0));
     }
 
     #[test]
@@ -1900,43 +1985,31 @@ mod tests {
         assert_eq!(handle.call_count(), 1);
 
         // And a zero-filled tensor — what `FakeSession::zeros` builds, and what
-        // a real graph returns for a frame it has nothing to say about — is
-        // *not* blank under this decode. `sigmoid(0)` is 0.5 for the objectness
-        // and for all 80 classes, so every row scores 0.25 and admits class 0.
+        // a real graph returns for a frame it has nothing to say about — yields
+        // **nothing** under the corrected score. This is the assertion that
+        // changed meaning when the decode was fixed, and it changed in the right
+        // direction.
         //
-        // Measured, and worth recording rather than asserting away: **all 3549
-        // rows survive**, and NMS removes none of them. Each row's box is
-        // `exp(0) * stride` square on a `stride`-spaced grid — 8x8 boxes on an
-        // 8-pixel grid — so neighbouring boxes abut exactly, their intersection
-        // is a line, and the IoU is 0.0 rather than the >0.45 suppression
-        // needs. The `score_thr = 0.1` floor does not help either: 0.25 is
-        // twice it. This is a property of the brief's formula that Task 12 will
-        // meet, and it means a phone-free frame cannot be recognised by its
-        // score alone.
+        // Under the brief's double sigmoid, a zeroed row scored
+        // `sigmoid(0) * sigmoid(0) = 0.25` on all 3549 rows, and **every one of
+        // them survived**: the 0.1 floor was twice too low, and NMS removed none
+        // because each row's box is `exp(0) * stride` square on a `stride`-spaced
+        // grid — 8x8 boxes on an 8-pixel grid — so neighbouring boxes abut
+        // exactly, their intersection is a line, and the IoU is 0.0 rather than
+        // the >0.45 suppression needs. A blank frame produced 3549 detections.
+        //
+        // Now `obj` is 0.0, so the product is 0.0 and every row is rejected on
+        // score. The multiplicative zero is what makes a blank tensor genuinely
+        // blank, and it is why `blank_row` is a zeroed row rather than a very
+        // negative logit.
         let (detector, _) = detector_returning(predictions_output(vec![0.0; ANCHORS * COLUMNS]));
-        let detections = detector.detect(&frame).expect("a well-formed output");
-        assert_eq!(
-            detections.len(),
-            ANCHORS,
-            "a zeroed tensor scores 0.25 on every row, and abutting boxes do \
-             not suppress each other"
-        );
-        assert_eq!(detections[0].score, 0.25);
-        assert_eq!(detections[0].class_id, PERSON_CLASS);
-        assert_eq!(
-            detections[0].rect,
-            Rect {
-                x: -16.0,
-                y: -16.0,
-                w: 32.0,
-                h: 32.0
-            },
-            "grid (0, 0) of stride 8, exp(0) * 8 = 8 in the tensor, x4 out of \
-             the letterbox: a box centred on the tensor's own corner"
-        );
         assert!(
-            detections.iter().all(|det| det.class_id == PERSON_CLASS),
-            "every one of them is class 0, by the lowest-id tie-break"
+            detector
+                .detect(&frame)
+                .expect("a well-formed output")
+                .is_empty(),
+            "a zeroed tensor scores 0.0 on every row, and 0.0 is below \
+             {SCORE_THRESHOLD}"
         );
     }
 
@@ -1973,9 +2046,9 @@ mod tests {
             // `Result` rather than panic or produce a non-finite box.
             let (detector, _) = detector_returning(predictions_output(tensor_with_one_row(
                 0,
-                0.0,
+                0.5,
                 PERSON_CLASS as usize,
-                0.0,
+                0.5,
                 [0.0, 0.0, 0.0, 0.0],
             )));
             let detections = detector
@@ -2011,12 +2084,7 @@ mod tests {
         );
         let tensor = preprocess(&sliver);
         assert!(
-            values(&tensor)
-                .iter()
-                .enumerate()
-                .all(|(index, value)| *value
-                    == (PAD_VALUE - MEAN[index / (INPUT_SIZE * INPUT_SIZE)])
-                        / STD[index / (INPUT_SIZE * INPUT_SIZE)]),
+            values(&tensor).iter().all(|value| *value == PAD_VALUE),
             "an empty content band leaves the whole tensor at the pad value"
         );
 
@@ -2029,20 +2097,15 @@ mod tests {
         let tensor = preprocess(&empty);
         assert_eq!(tensor.shape, vec![1, 3, 416, 416]);
         assert!(
-            values(&tensor)
-                .iter()
-                .enumerate()
-                .all(|(index, value)| *value
-                    == (PAD_VALUE - MEAN[index / (INPUT_SIZE * INPUT_SIZE)])
-                        / STD[index / (INPUT_SIZE * INPUT_SIZE)]),
+            values(&tensor).iter().all(|value| *value == PAD_VALUE),
             "a frame with no pixels is entirely pad"
         );
 
         let (detector, handle) = detector_returning(predictions_output(tensor_with_one_row(
             0,
-            0.0,
+            0.5,
             PERSON_CLASS as usize,
-            0.0,
+            0.5,
             [0.0, 0.0, 0.0, 0.0],
         )));
         let detections = detector
@@ -2099,17 +2162,9 @@ mod tests {
         // Tensor (0, 0) samples frame (0.0, 0.0) exactly: at a scale of 1.0 the
         // pixel-centre map is the identity, so bilinear interpolation returns
         // the frame's own pixel rather than a blend of four.
-        assert_eq!(
-            at(&tensor, 0, 0, 0),
-            (0.0 - MEAN[0]) / STD[0],
-            "tensor (0,0) is frame (0,0)"
-        );
-        assert_eq!(at(&tensor, 1, 0, 0), (0.0 - MEAN[1]) / STD[1]);
-        assert_eq!(
-            at(&tensor, 2, 0, 0),
-            (0.0 - MEAN[2]) / STD[2],
-            "and the ramp leaves red at zero"
-        );
+        assert_eq!(at(&tensor, 0, 0, 0), 0.0, "tensor (0,0) is frame (0,0)");
+        assert_eq!(at(&tensor, 1, 0, 0), 0.0);
+        assert_eq!(at(&tensor, 2, 0, 0), 0.0, "and the ramp leaves red at zero");
 
         // Every sample is the frame's own pixel, in both channels, at the
         // corners and in the middle. A sampler that read the frame's top-left
@@ -2127,35 +2182,31 @@ mod tests {
         for (column, row) in [(1, 0), (0, 1), (415, 0), (0, 415), (415, 415), (207, 133)] {
             assert_eq!(
                 at(&tensor, 0, column, row),
-                ((column % 256) as f32 - MEAN[0]) / STD[0],
+                (column % 256) as f32,
                 "blue at ({column}, {row}) is the frame's own column"
             );
             assert_eq!(
                 at(&tensor, 1, column, row),
-                ((row % 256) as f32 - MEAN[1]) / STD[1],
+                (row % 256) as f32,
                 "green at ({column}, {row}) is the frame's own row"
             );
-            assert_eq!(
-                at(&tensor, 2, column, row),
-                (0.0 - MEAN[2]) / STD[2],
-                "and red stays zero"
-            );
+            assert_eq!(at(&tensor, 2, column, row), 0.0, "and red stays zero");
         }
 
-        // Hand-computed literals for the far corner, so that a mutation of
-        // `MEAN` or `STD` fails here rather than moving the expectation with it.
-        // Column 415 of the ramp is blue 159 and green 159, so the tensor is
-        // (159 - 103.53)/57.375 = 0.9667974 and (159 - 116.28)/57.12 =
-        // 0.7478992 — and a BGR/RGB swap would give a different pair, since
-        // the two channels' means and stds differ.
-        assert_eq!(at(&tensor, 0, 415, 415), 0.9667974_f32);
-        assert_eq!(at(&tensor, 1, 415, 415), 0.7478992_f32);
-        assert_eq!(at(&tensor, 0, 0, 0), -1.8044444_f32);
-        // Column 207 is under 256, so it is its own value: (207 - 103.53)/57.375
-        // = 1.8032244, where the identity would give the same and a transposed
-        // sample would give green's 1.5806373.
-        assert_eq!(at(&tensor, 0, 207, 133), 1.8033987_f32);
-        assert_eq!(at(&tensor, 1, 207, 133), 0.2927171_f32);
+        // Hand-computed literals for two of them, so that a mutation of the
+        // sampler fails here on the value rather than moving an expectation with
+        // it. Column 415 of the ramp is blue 159 and green 159; column 207 is
+        // under 256 so it is its own value, and a transposed sample would give
+        // green's 133 instead.
+        assert_eq!(at(&tensor, 0, 415, 415), 159.0);
+        assert_eq!(at(&tensor, 1, 415, 415), 159.0);
+        assert_eq!(at(&tensor, 0, 0, 0), 0.0);
+        assert_eq!(at(&tensor, 0, 207, 133), 207.0);
+        assert_eq!(at(&tensor, 1, 207, 133), 133.0);
+        // The raw regime, restated where it would be easiest to get wrong: these
+        // are the frame's bytes, not a scaled or centred version of them.
+        assert_ne!(at(&tensor, 0, 207, 133), 207.0 / 255.0);
+        assert_ne!(at(&tensor, 0, 207, 133), (207.0 - 103.53) / 57.375);
 
         // The *scale* is what the sampler divides by, and at scale 1.0 that
         // division is invisible — so the padding test below uses 4.0, and this
