@@ -1920,11 +1920,47 @@ mod tests {
         // value — a confidence a caller can threshold directly, with no ceiling
         // at 0.534 and no double-activation compression.
         let frame = letterboxed_frame((10, 20, 30));
+
+        // The threshold's value, pinned as a literal so that moving it needs a
+        // deliberate edit here too. Without this, nothing in the file states
+        // what the number *is*: every fixture happens to score either well above
+        // or at zero, so lowering the threshold to 0.05 changed no test result.
+        // A threshold that no test can distinguish from any lower threshold is
+        // not being tested at all.
+        assert_eq!(
+            SCORE_THRESHOLD, 0.25,
+            "YOLOX's own --conf default, and the value the calibration chose"
+        );
+
+        // A row scoring comfortably above the threshold, and one scoring between
+        // 0.05 and 0.25 — the band that only exists if the threshold is 0.25.
+        // `0.5 * 0.5 = 0.25` is the boundary itself and is admitted.
+        for (label, objectness, class_score, survives) in [
+            ("just above the threshold", 0.5f32, 0.5f32, true),
+            ("well above", 0.75, 0.5, true),
+            ("in the 0.05-0.25 band", 0.1, 0.5, false),
+            ("just under", 0.2, 0.5, false),
+            ("far under", 0.05, 0.5, false),
+        ] {
+            let (detector, _) = detector_for_row(
+                0,
+                &row_for(objectness, PERSON_CLASS as usize, class_score, [0.0; 4]),
+            );
+            let detections = detector.detect(&frame).expect("a well-formed output");
+            assert_eq!(
+                !detections.is_empty(),
+                survives,
+                "{label}: {} * {} = {} against a threshold of {SCORE_THRESHOLD}",
+                objectness,
+                class_score,
+                objectness * class_score
+            );
+        }
+
         for (label, objectness, class_score) in [
             ("both confident", 0.9f32, 0.9f32),
-            ("object only", 0.9, 0.1),
-            ("class only", 0.1, 0.9),
-            ("neither", 0.1, 0.1),
+            ("object only", 0.9, 0.3),
+            ("class only", 0.3, 0.9),
             ("saturated", 1.0, 1.0),
             ("zero objectness", 0.0, 1.0),
             ("zero class", 1.0, 0.0),
@@ -1964,6 +2000,76 @@ mod tests {
             1.0,
             "the score can reach 1.0; it is not compressed into [0.25, 0.534]"
         );
+    }
+
+    #[test]
+    fn a_tie_for_the_best_class_resolves_to_the_lowest_id() {
+        // A decision, not an accident, and it needs its own test because no
+        // other fixture has a *tie*: every other row has one class clearly above
+        // the rest, so changing the argmax's strict `>` to `>=` — which makes
+        // `max_by`'s last-maximum behaviour the effective rule — changed no test
+        // result.
+        //
+        // The rule matters because a row whose class scores are all equal is the
+        // common case for a blank or zeroed tensor, and 3549 of them reporting
+        // class 79 (`toothbrush`) rather than class 0 is a difference a consumer
+        // can see.
+        let frame = letterboxed_frame((10, 20, 30));
+
+        // All eighty classes given the same score, so the maximum is a tie
+        // across the whole head.
+        let mut tied = blank_row();
+        tied[4] = 0.5;
+        for class in 0..CLASSES {
+            tied[5 + class] = 0.75;
+        }
+        let (detector, _) = detector_for_row(0, &tied);
+        let detections = detector.detect(&frame).expect("a well-formed output");
+        assert_eq!(detections.len(), 1);
+        assert_eq!(
+            detections[0].class_id, PERSON_CLASS,
+            "an all-equal row must claim the lowest class id, not the last"
+        );
+        assert_eq!(detections[0].score, 0.375, "0.5 * 0.75");
+        assert_eq!(CLASSES, 80, "and there are eighty of them");
+        assert_ne!(
+            PERSON_CLASS,
+            CLASSES as u32 - 1,
+            "the lowest id is not the highest, or this test would prove nothing"
+        );
+
+        // A two-way tie between classes 66 and 67, neither of them the lowest id
+        // and neither of them wanted by the class filter, so the rule is "first
+        // maximum wins" and not "class 0 always wins".
+        const KEYBOARD: usize = 66;
+        let mut pair = blank_row();
+        pair[4] = 0.5;
+        pair[5 + KEYBOARD] = 0.75;
+        pair[5 + CELL_PHONE_CLASS as usize] = 0.75;
+        let (detector, _) = detector_for_row(0, &pair);
+        let detections = detector.detect(&frame).expect("a well-formed output");
+        // The tie resolves to 66, which is unwanted, so nothing is returned.
+        // That is the assertion: had the argmax fallen through to the *wanted*
+        // class 0 (whose own score is 0) the tie-break would be wrong in a way
+        // that manufactured a detection.
+        assert!(
+            detections.is_empty(),
+            "a tie between two unwanted classes must not fall through to a \
+             wanted one, got {detections:?}"
+        );
+
+        // The other direction: a wanted class tied with a higher unwanted one
+        // must lose to the *unwanted* higher id only if its own id is higher.
+        // Class 0 is the lowest there is, so a tie between person and any other
+        // class resolves to person.
+        let mut person_tied = blank_row();
+        person_tied[4] = 0.5;
+        person_tied[5 + PERSON_CLASS as usize] = 0.75;
+        person_tied[5 + 18] = 0.75;
+        let (detector, _) = detector_for_row(0, &person_tied);
+        let detections = detector.detect(&frame).expect("a well-formed output");
+        assert_eq!(detections.len(), 1, "person wins the tie and is wanted");
+        assert_eq!(detections[0].class_id, PERSON_CLASS);
     }
 
     #[test]
@@ -2125,6 +2231,117 @@ mod tests {
                 h: 8.0
             },
             "grid (0, 0) of stride 8 with raw (0, 0): exp(0) * 8 = 8"
+        );
+    }
+
+    #[test]
+    fn preprocessing_matches_an_external_build() {
+        // The unit tests above share one weakness and it is the weakness that
+        // let R39 through: they compare the tensor `preprocess` builds against
+        // expectations written from the *same* reading of the convention. A
+        // wrong convention moves both sides together and the suite stays green.
+        //
+        // This prints a checksum of the tensor for a fixed synthetic frame.
+        // `research/yolox/crosscheck_tensor.py` builds the same frame through the
+        // same pipeline independently in Python. Run it with `-- --nocapture`:
+        //
+        // ```text
+        // cargo test -p lockin-vision models::yolox::tests::preprocessing_matches_an_external_build -- --nocapture
+        // python research/yolox/crosscheck_tensor.py
+        // ```
+        //
+        // What the two agree on, measured:
+        //
+        // | quantity | Rust (f32) | Python (f64) |
+        // |---|---|---|
+        // | scale | 0.416 | 0.416 |
+        // | content band | 416 x 288 | 416 x 288 |
+        // | `remap(0)`, `remap(1)` | 0.701923, 3.1057692 | 0.701923, 3.105769 |
+        // | tensor (0, 0) blue/green/red | 0.701923, 0.701923, 7.0192304 | 0.701923, 0.701923, 7.019231 |
+        // | sum over 519,168 values | 62181769.286227 | 62181768.758299 |
+        // | values equal to the pad | 159745 | 159751 |
+        //
+        // **The sums differ by 0.53 out of 62 million** — a relative 8.5e-9,
+        // which is f32's own rounding accumulated over half a million additions,
+        // and the per-pixel samples agree to six decimals. The pad *counts*
+        // differ by exactly 6 for a related reason: the synthetic frame's own
+        // values can equal 114, so a handful of content pixels legitimately
+        // coincide with the pad value and the two precisions disagree about
+        // whether they do. Plane 0's count matches exactly (53248), and the
+        // content band, scale and remap positions all match exactly, which is
+        // what makes this a rounding difference and not a geometric one.
+        //
+        // That is the point of the exercise: two independent implementations of
+        // the regime agree on everything a wrong convention would have changed —
+        // the pad value, the colour order, the content band's extent, the resize
+        // mapping — and differ only in the last bits of accumulated float
+        // arithmetic.
+        let frame = frame_with(1000, 700, |x, y| {
+            (
+                (x % 251) as u8,
+                (y % 241) as u8,
+                ((x * 7 + y * 3) % 256) as u8,
+            )
+        });
+        let tensor = preprocess(&frame);
+        let values = values(&tensor);
+
+        let sum: f64 = values.iter().map(|value| f64::from(*value)).sum();
+        let weighted: f64 = values
+            .iter()
+            .enumerate()
+            .map(|(index, value)| f64::from(*value) * index as f64)
+            .sum();
+        let off_pad = values.iter().filter(|value| **value != PAD_VALUE).count();
+
+        println!("EXTERNAL CHECKSUM sum      = {sum:.6}");
+        println!("EXTERNAL CHECKSUM weighted = {weighted:.6}");
+        println!("EXTERNAL CHECKSUM off_pad  = {off_pad}");
+
+        // The assertions the test can make on its own, without the Python half.
+        // They pin the *shape* of the tensor rather than its arithmetic, and each
+        // one is something a wrong convention would move.
+        assert_eq!(tensor.shape, vec![1, 3, 416, 416]);
+        assert_eq!(values.len(), CHANNELS * INPUT_SIZE * INPUT_SIZE);
+
+        // The content band is 416 x 288 = 119,808 pixels per plane, of which a
+        // handful coincide with the pad value. Bounding the count by that
+        // geometry rather than by a magic number: an all-pad tensor, or one
+        // whose content band were the full 416 rows, fails here.
+        let band = 416 * 288 * CHANNELS;
+        assert!(
+            off_pad < band,
+            "some content pixels coincide with the pad value: {off_pad} vs {band}"
+        );
+        assert!(
+            off_pad > band - 64,
+            "but almost all of them do not: a tensor whose content band was \
+             mostly pad would say the wrong thing, got {off_pad} of {band}"
+        );
+        let pad_count = values.len() - off_pad;
+        let expected_pad = INPUT_SIZE * (INPUT_SIZE - 288) * CHANNELS;
+        assert!(
+            pad_count >= expected_pad && pad_count < expected_pad + 64,
+            "the pad is the 128 rows below the band — {expected_pad} values — \
+             plus a few coincidences, got {pad_count}"
+        );
+
+        // And the mean of the whole tensor, which is the single number a wrong
+        // regime moves furthest. The frame is *not* uniform — its blue and green
+        // channels ramp 0..250 and its red runs 0..255 — so the content averages
+        // about 125 and the 128 pad rows contribute their 114, putting the whole
+        // tensor at 119.77.
+        //
+        // That is what makes this assertion discriminate: a standardised tensor
+        // centres on zero (`(x - mean) / std` over content averaging 125 gives
+        // roughly +0.4, but the pad would be a wildly different value in the same
+        // regime), and a `/255` tensor sits near 0.47. Both are more than two
+        // orders of magnitude away from 119.77.
+        let mean = sum / values.len() as f64;
+        assert!(
+            (110.0..130.0).contains(&mean),
+            "the tensor holds raw 0-255 pixels, so its mean is around 119.8; a \
+             /255 tensor would be ~0.47 and a standardised one ~0, got {mean}"
         );
     }
 
