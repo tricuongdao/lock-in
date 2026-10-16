@@ -875,11 +875,41 @@ impl YoloxNano {
     /// means the sample does not discriminate within it, and a labelled
     /// desk-domain set could easily move the value.
     ///
-    /// A second finding, which matters more than the threshold: **no `cell
-    /// phone` is detected at any threshold.** The strongest phone-class score
-    /// across the three images is **0.0052**, and the desk frame — which does
-    /// contain a phone — scores 0.0000. Whatever the phone signal becomes, it
-    /// will not come from this model on this evidence; see the report's concerns.
+    /// # The phone class works, and fix round 2 said it did not
+    ///
+    /// Fix round 2 of this task concluded, in this doc and in the report, that
+    /// **no `cell phone` was detected at any threshold** — the strongest phone
+    /// score across the three images used was 0.0052. **That conclusion was
+    /// wrong, and its error was the evaluation set rather than the model.** Those
+    /// three images were picked for being easy COCO samples; none of them
+    /// contained a phone at a scale this detector can see, so the measurement was
+    /// "this detector finds no phones in three images without usable phones".
+    ///
+    /// Re-measured on **18 COCO val2017 images that COCO annotates as containing
+    /// a `cell phone`** (42 phone instances, selected by annotation rather than
+    /// by eye), against the ground-truth boxes at IoU 0.5:
+    ///
+    /// | model | params | 416² infer | phone P / R / F1 | ≥2%-of-frame phone recall | person P / R / F1 |
+    /// |---|---|---|---|---|---|
+    /// | **nano (shipped)** | 0.9M | **8.5 ms** | 0.875 / 0.333 / 0.483 | **68%** | 0.821 / 0.640 / 0.719 |
+    /// | tiny | 5.0M | 29.0 ms | 0.941 / 0.381 / 0.542 | **68%** | 0.870 / 0.800 / 0.833 |
+    /// | s (640²) | 9.0M | 93.6 ms | 0.957 / 0.524 / 0.677 | **68%** | 0.750 / 0.840 / 0.792 |
+    ///
+    /// **All three variants are identical — 68% recall — on phones that occupy
+    /// at least 2% of the frame**, which is the case a desk webcam sees. The
+    /// 0.33/0.38/0.52 headline recall is entirely about COCO's very small,
+    /// edge-on and occluded instances: in the `<0.2%` bucket nano and tiny find
+    /// **none** while `s` finds 32%. So nano's deficit is real but confined to
+    /// phones this product does not need to see, and the shipped variant stays
+    /// nano. `s` is the variant to move to if arm's-length phone use ever becomes
+    /// a requirement; it costs 11x the inference and changes one constant
+    /// (`INPUT_SIZE`, with the anchor count already derived from it).
+    ///
+    /// The threshold is unchanged at 0.25, re-derived on this set rather than
+    /// inherited: for nano it is the phone-F1 optimum of the sweep (F1 0.483 at
+    /// 0.25 against 0.522 at 0.05, but at 0.875 precision against 0.667 — and for
+    /// this product a false phone is a false `PhoneInUse` nudge, so precision
+    /// dominates) and it sits within 0.001 of nano's person-F1 optimum.
     ///
     /// # What the boxes mean
     ///
