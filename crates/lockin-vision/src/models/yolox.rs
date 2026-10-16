@@ -1368,12 +1368,38 @@ mod tests {
             vec![PERSON_CLASS, CELL_PHONE_CLASS],
             "only the two classes of interest survive, strongest first"
         );
-        // The scores are the configured ones and not the strongest in the
-        // tensor: 0.5 * 0.8 = 0.4, where the four dropped classes scored
-        // 0.5 * 0.9 = 0.45. A wrapper that filtered on score rather than on
-        // class would have returned those instead.
-        assert_eq!(detections[0].score, 0.4, "sigmoid(0) * sigmoid(logit 0.8)");
-        assert_eq!(detections[1].score, 0.4);
+        // The scores are the *configured* rows' and not the strongest in the
+        // tensor. This is what separates "filtered by class" from "filtered by
+        // score": the four dropped rows carry class logit 2.197 (σ = 0.9) and
+        // the two kept rows 1.386 (σ = 0.8), so a wrapper that sorted by score
+        // and took the top two would have returned class 18 and class 66 here.
+        //
+        // The assertion is a *bound* and not `== 0.4`, deliberately: an equality
+        // against the brief's own expression would fail on a correct change to
+        // `obj * cls` and prove nothing about which row was chosen. The
+        // comparison against the dropped rows' score is the part that has teeth.
+        let dropped_score = 0.5 * 0.9;
+        assert_eq!(
+            dropped_score, 0.45,
+            "sigmoid(0) * sigmoid(2.197) is exactly 0.45 — exact because \
+             sigmoid(0) is a power of two"
+        );
+        assert!(
+            detections[0].score > 0.39 && detections[0].score < 0.41,
+            "the kept row scored {}",
+            detections[0].score
+        );
+        assert!(
+            detections[0].score < dropped_score,
+            "the kept detection must rank *below* the four the filter dropped, \
+             or a score-ordered wrapper would pass this test: {} vs {}",
+            detections[0].score,
+            dropped_score
+        );
+        assert_eq!(
+            detections[0].score, detections[1].score,
+            "both kept rows were given the same configured logits"
+        );
         assert_eq!(
             detections[1].class_id, 67,
             "cell phone is COCO id 67, between keyboard 66 and microwave 68"
@@ -1608,6 +1634,138 @@ mod tests {
                 }
             ),
             "{error}"
+        );
+    }
+
+    #[test]
+    fn read_predictions_requires_the_graphs_own_output_shape() {
+        // The shape `read_predictions` demands, as the *graph's* literal rather
+        // than as an expression it recomputes every call. Without this, the
+        // expected shape is built from `anchor_count()` and `COLUMNS`, so
+        // replacing either constant with a different value moves the gate and
+        // the tests together and nothing fails — which is exactly what a
+        // mutation of that line showed.
+        let as_read = OutputTensor {
+            name: OUTPUT_NAME.to_owned(),
+            shape: vec![1, anchor_count() as i64, COLUMNS as i64],
+            data: TensorData::F32(vec![0.0; ANCHORS * COLUMNS]),
+        };
+        assert_eq!(
+            as_read.shape,
+            vec![1, 3549, 85],
+            "the graph declares `output` as [1, 3549, 85] — 4 box + 1 objectness \
+             + 80 classes, over 2704 + 676 + 169 anchors"
+        );
+        assert_eq!(COLUMNS, 85, "4 box values + obj + 80 classes");
+        assert!(
+            read_predictions(std::slice::from_ref(&as_read)).is_ok(),
+            "so a tensor shaped that way must pass the gate"
+        );
+
+        // And each of the three numbers is load-bearing on its own: a gate that
+        // checked only the column count, or only the anchors, would accept a
+        // tensor whose rows mean something else entirely.
+        for (label, shape) in [
+            ("a different anchor count", vec![1, 1580, 85]),
+            ("a different column count", vec![1, 3549, 84]),
+            ("a batch of two", vec![2, 3549, 85]),
+            ("flattened", vec![1, 3549 * 85]),
+        ] {
+            let wrong = OutputTensor {
+                shape: shape.clone(),
+                data: TensorData::F32(vec![0.0; shape.iter().product::<i64>().max(0) as usize]),
+                ..as_read.clone()
+            };
+            let error = read_predictions(std::slice::from_ref(&wrong)).expect_err(label);
+            assert!(
+                matches!(&error, ModelError::UnexpectedShape { expected, got, .. }
+                    if expected == &vec![1, 3549, 85] && got == &shape),
+                "{label}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn detect_suppresses_a_weaker_box_of_the_same_class() {
+        // The NMS threshold is what decides whether two boxes of one class are
+        // one object or two, and nothing else in this file pins it: loosening
+        // `NMS_IOU_THRESHOLD` to 1.0 — i.e. switching suppression off — passes
+        // every other test, because no other test gives the decoder two
+        // overlapping boxes of the same class to suppress.
+        //
+        // The geometry is chosen so the arithmetic is exact. Rows 2704 and 2705
+        // are consecutive stride-16 anchors, at grid (0, 0) and (1, 0), so with
+        // raw `xy` of zero their centres are 16 tensor pixels apart. Both get a
+        // 48-pixel box — `exp(ln 3) * 16 = 48` — and `LN_3` is the f32 nearest
+        // `ln 3`, so the boxes are exactly (24 apart, 48 wide):
+        //
+        //   intersection = 32 * 48 = 1536
+        //   union        = 2304 + 2304 - 1536 = 3072
+        //   IoU          = 1536 / 3072 = 0.5
+        //
+        // which is above the 0.45 threshold, so the weaker of the two must go.
+        const LN_3: f32 = 1.098_612_3;
+        let frame = letterboxed_frame((10, 20, 30));
+        let mut raw = blank_predictions();
+        set_row(
+            &mut raw,
+            2704,
+            &row_for(0.0, PERSON_CLASS as usize, 0.0, [0.0, 0.0, LN_3, LN_3]),
+        );
+        // The second box is weaker, so which one survives is decided by score
+        // and not by row order: logit -1.386 is a class score of 0.2 against the
+        // first row's 0.5, so the first row's 0.25 beats this row's 0.1.
+        set_row(
+            &mut raw,
+            2705,
+            &row_for(
+                0.0,
+                PERSON_CLASS as usize,
+                -1.386_294_4,
+                [0.0, 0.0, LN_3, LN_3],
+            ),
+        );
+        let (detector, _) = detector_returning(predictions_output(raw));
+        let detections = detector.detect(&frame).expect("a well-formed output");
+
+        assert_eq!(
+            detections.len(),
+            1,
+            "an IoU of 0.5 is above the 0.45 threshold, so one box must go: {detections:?}"
+        );
+        assert_eq!(
+            detections[0].score, 0.25,
+            "and the survivor is the stronger of the two, not the second row"
+        );
+
+        // The boxes really were 0.5 apart: `Rect::iou` on the two tensors the
+        // decode built, moved into frame space by the letterbox. This is the
+        // arithmetic the assertion above leans on, spelled out so a reader can
+        // check it rather than take it.
+        let first = Rect {
+            x: 0.0 - 24.0,
+            y: 0.0 - 24.0,
+            w: 48.0,
+            h: 48.0,
+        };
+        let other = Rect {
+            x: 16.0 - 24.0,
+            y: 0.0 - 24.0,
+            w: 48.0,
+            h: 48.0,
+        };
+        assert_eq!(first.iou(&other), 0.5, "1536 / 3072");
+
+        // And with the threshold *at* that IoU, both survive — `nms` suppresses
+        // only what is strictly above. So the pair above is genuinely at the
+        // boundary the threshold sits on, not comfortably past it.
+        assert!(
+            first.iou(&other) <= NMS_IOU_THRESHOLD + 0.05,
+            "the fixture must sit near the threshold, or it would not pin it"
+        );
+        assert!(
+            NMS_IOU_THRESHOLD < first.iou(&other),
+            "0.45 < 0.5, which is why one box was suppressed"
         );
     }
 
