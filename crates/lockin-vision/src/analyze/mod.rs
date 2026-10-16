@@ -11,4 +11,5 @@
 pub mod eyes;
 pub mod intrinsics;
 pub mod nms;
+pub mod phone;
 pub mod pose;
