@@ -85,23 +85,71 @@
 //! and `bbox` looking entirely plausible.
 //!
 //! Testing the plausible conventions against each other settled it. **Only raw
-//! `0–255` produces a healthy `obj` distribution**:
+//! `0–255` produces a healthy `obj` distribution.** The counts below are
+//! **two-class** — what [`YoloxNano::detect`] returns, not the 80-class total,
+//! which is a distinction an earlier version of this table got wrong:
 //!
-//! | input convention | `obj` max (3 images) | detections at 0.25 |
+//! | input convention | `obj` max (3 images) | two-class boxes at 0.25 |
 //! |---|---|---|
-//! | **raw 0–255 — adopted** | **0.893 / 0.997 / 0.994** | **3 / 1 / 9** |
-//! | the brief's mean/std | 0.011 / 0.005 / 0.003 | 0 / 0 / 0 |
-//! | RGB instead of BGR | 0.010 / 0.006 / 0.002 | — |
-//! | `/255`, no mean | 0.0003 / 0.0002 / 0.0003 | — |
-//! | mean/std, pad 0 instead of 114 | 0.008 / 0.006 / 0.004 | — |
+//! | **raw 0–255 — adopted** | **0.893 / 0.997 / 0.994** (mean 0.961) | **0 / 0 / 2** |
+//! | the brief's mean/std | 0.011 / 0.005 / 0.003 (mean 0.006) | 0 / 0 / 0 |
+//! | `/255`, no mean | 0.0003 / 0.0002 / 0.0003 | 0 / 0 / 0 |
+//! | mean/std, pad 0 instead of 114 | 0.008 / 0.006 / 0.004 | 0 / 0 / 0 |
+//! | raw `0–255`, **RGB** instead of BGR | 0.661 / 0.997 / 0.966 (mean 0.875) | 0 / 0 / 1 |
 //!
-//! The `obj` tail comes back by **93x** under the raw scale, and every variant
-//! that standardises the input collapses it to ~0.005 *regardless of colour
-//! order or pad value* — so the fault is the standardisation itself and not any
-//! neighbouring choice. Under the brief's regime the detector returned **no
-//! boxes at all** on all three images; under the raw scale it frames the
-//! television, the chairs, the dining table and a person in a room, and two cats
-//! and a sofa in another. See [`preprocess`] for the table and
+//! The `obj` tail comes back by **~160x on the maxima** (0.961 vs 0.006 mean) or
+//! **91x on the overall maximum** (0.997 vs 0.011), depending which summary is
+//! read — the two roundings are both in this file's history and the figures
+//! above are the ones reproducible from the table. Every variant that
+//! standardises the input collapses `obj` to ~0.005 *regardless of pad value*,
+//! which is what isolates the standardisation as the fault rather than a
+//! neighbouring choice.
+//!
+//! ## BGR or RGB: settled by measurement, and the answer is BGR
+//!
+//! This is the one part of the convention that is **not** settled by a large
+//! margin, and an earlier version of this file asserted it as fact on the
+//! strength of a variant that was never actually run: the "RGB" row in the
+//! original table reversed the channels **and** re-ordered the mean/std, so it
+//! was a *standardised* run and raw-RGB had never been measured. Run properly,
+//! with everything else fixed:
+//!
+//! | image | raw-BGR `obj` max | raw-RGB `obj` max |
+//! |---|---|---|
+//! | two cats | **0.8930** | 0.6606 |
+//! | desk | **0.9970** | 0.9968 |
+//! | room | **0.9942** | 0.9662 |
+//!
+//! BGR is ahead on all three, but only decisively on one. **The two are close
+//! enough on these three images that the measurement alone does not settle it**,
+//! which is worth stating plainly rather than dressing up. What breaks the tie:
+//!
+//! * two-class detections at 0.25 are **0 / 0 / 2** for BGR against **0 / 0 / 1**
+//!   for RGB — and the one RGB keeps is the weaker of the room's two people
+//!   (0.571 against BGR's 0.691);
+//! * `obj` p99 on the room frame is 0.608 for BGR against 0.488 for RGB;
+//! * upstream, `yolox/data/data_augment.py`'s `preproc` **reverses** the
+//!   `cv2`-read BGR before inference, i.e. YOLOX feeds RGB.
+//!
+//! **That last point argues for RGB, and I did not adopt it.** The disagreement
+//! is real and is recorded here rather than smoothed over: the upstream
+//! convention and my measurement point opposite ways on a three-image sample
+//! that is too small to be decisive, and the measurement is what this wrapper
+//! ships. If LOCK-IN later has labelled desk-domain frames, RGB is the variant
+//! worth re-testing first — the difference on these images is one detection at
+//! one threshold, not a structural failure either way.
+//!
+//! Note also what the old table got wrong about the *argument*: "YOLOX has no
+//! mean/std option" is **false**. `ValTransform(legacy=True)` does `/255` and
+//! then ImageNet mean/std, and the brief's `103.53 / 116.28 / 123.675` are
+//! exactly ImageNet's per-channel means **times 255**. The brief was not
+//! inventing numbers. What the numbers are *for* is the PyTorch training and
+//! `legacy` eval path, not this ONNX export — and that is a claim the
+//! measurements above support and the file-path argument did not.
+//!
+//! Under the brief's regime the detector returned **no boxes at all** on all
+//! three images; under the raw scale it returns every person present. See
+//! [`preprocess`] for the table and
 //! `research/yolox/diagnose_preprocessing.py` for the measurement.
 //!
 //! This is the second time in this task that a plausible-looking output hid a
@@ -117,11 +165,26 @@
 //! reverses to RGB and scales by `1/255` with no mean, and the eye classifier
 //! subtracts 127 and divides by 255 to a square with no letterbox at all.
 //!
+//! Two of the four are supported by measurement rather than by the brief:
+//!
+//! * **raw `0–255`** — standardising collapses `obj` from 0.997 to 0.011 and the
+//!   detector to zero boxes. §R39 above.
+//! * **BGR** — ahead of RGB on all three test images, but only decisively on
+//!   one, and upstream argues the other way. §"BGR or RGB" above records both
+//!   sides; this is the least certain part of the convention.
+//!
 //! The `114` is downstream evidence for the raw regime: it is meaningful as a
 //! *pixel value* between 0 and 255, and meaningless as a standardised
-//! coordinate. The official YOLOX `preprocess.py` again has `color_aug`,
-//! `mosaic` and `mixup` options and **no mean/std option at all**, and no
-//! `--mean`/`--std` flag exists in the repository's `exps/` or `tools/`.
+//! coordinate.
+//!
+//! **Correction to an earlier version of this comment**, which claimed the
+//! official YOLOX preprocess "has no mean/std option at all" and cited
+//! `yolox/data/datasets/preprocess.py` for it. Both were wrong: that path does
+//! not exist on `main`, and `ValTransform(legacy=True)` in
+//! `yolox/data/data_augment.py` does exactly `/255` followed by ImageNet
+//! mean/std. The brief's constants **are** ImageNet's (times 255), so the brief
+//! was not inventing them — they simply do not apply to this ONNX export, which
+//! is a conclusion the measurements establish and the old citation did not.
 
 use crate::analyze::nms::{Detection, Rect, nms};
 use crate::frame::Frame;
@@ -193,9 +256,11 @@ const NMS_IOU_THRESHOLD: f32 = 0.45;
 
 /// Score below which a row is not a detection at all.
 ///
-/// `0.25` — YOLOX's own default `--nms 0.45 --conf 0.25`. See [`YoloxNano::detect`]
-/// for the measurement, and for what the number means given that the graph has
-/// already applied its sigmoids.
+/// `0.25`, chosen from this crate's own two-class measurements rather than
+/// attributed to an upstream default — see [`YoloxNano::detect`]. (An earlier
+/// version of this comment called it "YOLOX's own `--conf` default". **There is
+/// no `--conf` flag.** The ONNX demo hardcodes `score_thr=0.1` and its CLI flag
+/// is `-s/--score_thr` defaulting to 0.3.)
 const SCORE_THRESHOLD: f32 = 0.25;
 
 /// The exponent a raw width or height is clamped to, in both directions.
@@ -443,21 +508,25 @@ fn sample_bgr(frame: &Frame, x: f32, y: f32) -> (f32, f32, f32) {
 /// The brief specified ImageNet mean `[103.53, 116.28, 123.675]` and std
 /// `[57.375, 57.12, 58.395]`. **Subtracting them was wrong, and it silently
 /// destroyed the detector.** Measured on three COCO val images, five candidate
-/// conventions, `obj` taken *after* the graph's own sigmoid:
+/// conventions, `obj` taken *after* the graph's own sigmoid. The counts are
+/// **two-class** — what `detect` returns — and the colour-order row is the
+/// properly-isolated raw-RGB run, not the standardised one an earlier version of
+/// this table mislabelled:
 ///
-/// | input convention | `obj` max | detections at 0.25 |
+/// | input convention | `obj` max (mean) | two-class boxes at 0.25 |
 /// |---|---|---|
-/// | **raw 0–255 (this one)** | **0.893 / 0.997 / 0.994** | **3 / 1 / 9** |
-/// | the brief's mean/std | 0.011 / 0.005 / 0.003 | 0 / 0 / 0 |
-/// | RGB instead of BGR | 0.010 / 0.006 / 0.002 | — |
-/// | `/255`, no mean | 0.0003 / 0.0002 / 0.0003 | — |
-/// | mean/std with pad 0 | 0.008 / 0.006 / 0.004 | — |
+/// | **raw 0–255, BGR (this one)** | **0.893 / 0.997 / 0.994 (0.961)** | **0 / 0 / 2** |
+/// | raw 0–255, **RGB** | 0.661 / 0.997 / 0.966 (0.875) | 0 / 0 / 1 |
+/// | the brief's mean/std | 0.011 / 0.005 / 0.003 (0.006) | 0 / 0 / 0 |
+/// | `/255`, no mean | 0.0003 / 0.0002 / 0.0003 | 0 / 0 / 0 |
+/// | mean/std with pad 0 | 0.008 / 0.006 / 0.004 | 0 / 0 / 0 |
 ///
 /// A healthy objectness head has a long right tail towards 1.0. Only the raw
-/// scale produces one, and it does so by **93x**. Every variant that
-/// standardises the input collapses `obj` to ~0.005 regardless of colour order
-/// or pad value, so the fault is the standardisation itself and not any of the
-/// neighbouring choices.
+/// scale produces one — by **~160x on the per-image maxima** (mean 0.961 against
+/// 0.006), or **91x on the overall maximum** (0.997 against 0.011) depending on
+/// which summary is read. Every variant that standardises the input collapses
+/// `obj` to ~0.005 regardless of pad value, so the fault is the standardisation
+/// itself and not any of the neighbouring choices.
 ///
 /// The failure mode is the one this whole task is about: the deformed input
 /// still produced a *plausible-looking* `cls` (max 0.76, correct argmax classes)
@@ -465,21 +534,20 @@ fn sample_bgr(frame: &Frame, x: f32, y: f32) -> (f32, f32, f32) {
 /// 0.005 and the detector returned **no boxes at all**. A reviewer reading only
 /// shapes and class names would have passed it.
 ///
-/// The raw regime is also what YOLOX itself documents: the official
-/// `yolox/data/datasets/preprocess.py` has thorough `color_aug`, `mosaic` and
-/// `mixup` options and **no mean/std option at all**, and no `--mean`/`--std`
-/// flag exists anywhere in the repository's `exps/` or `tools/`. The value of
-/// `PAD_VALUE` of 114 is downstream evidence for the same conclusion: 114 is
-/// meaningful as a *pixel value* between 0 and 255, and meaningless as a
-/// standardised coordinate.
-///
 /// # The three parts that are load-bearing
 ///
 /// * **Raw `0–255`, no `/255`.** Dividing scales the tensor ~255x too small and
 ///   collapses `obj` to 0.0003, which is worse than the mean/std error.
-/// * **BGR, not RGB.** Reversing the channels is Face Mesh's regime; here it
-///   costs the objectness head its tail too (0.010 vs 0.893).
+/// * **BGR rather than RGB** — on measurement, though by a narrow margin, and
+///   against upstream's own convention. See the module docs: the two are close
+///   enough on three images that this is the least certain part of the regime,
+///   and RGB is the first thing to re-test against labelled desk-domain frames.
 /// * **Pad 114**, at the bottom and right, not centred.
+///
+/// And one correction to an earlier version of this comment: YOLOX *does* have a
+/// mean/std path (`ValTransform(legacy=True)`), and the brief's constants are
+/// ImageNet's times 255. The claim that upstream has "no mean/std option at all",
+/// and the `datasets/preprocess.py` citation for it, were both wrong.
 ///
 /// # R39: this needed a test that could see it
 ///
@@ -594,10 +662,15 @@ fn decode_row(raw: &[f32], row: usize, wanted: &[u32]) -> Option<Detection> {
         return None;
     }
 
-    // A non-finite *class* logit is rejected for the same reason, and it would
+    // A non-finite *class* value is rejected for the same reason, and it would
     // otherwise be invisible: `finite_raw` maps a NaN to `-MAX_EXPONENT`, whose
-    // sigmoid is 2.06e-9 — a score that no comparison would flag, silently
-    // replacing a broken tensor with a confident "no object here".
+    // product with the objectness is a *negative* score. A negative score is
+    // below `SCORE_THRESHOLD` and so is rejected too — but by accident, and the
+    // class the row would have claimed is decided by a comparison over values
+    // that are not numbers. Rejecting here makes the reason explicit rather than
+    // relying on the arithmetic to land on the right side. (This comment used to
+    // justify the gate by the *sigmoid* of `-MAX_EXPONENT`; that function is
+    // gone, and the argument no longer applies.)
     if raw[5..COLUMNS].iter().any(|value| !value.is_finite()) {
         return None;
     }
@@ -764,29 +837,49 @@ impl YoloxNano {
     /// independent, `score >= 0.25` is roughly "both are at least moderate" —
     /// e.g. `obj 0.5, cls 0.5`, or `obj 0.9, cls 0.28`.
     ///
-    /// `0.25` is YOLOX's own default (`--conf 0.25`), and it is where the
-    /// measured detections sit: on three COCO val images the corrected pipeline
-    /// returns **3 / 1 / 9** boxes after NMS at 0.25, all of them objects that
-    /// are visibly present (two cats and a sofa; a figure; a television, three
-    /// chairs, a dining table, a person, a clock). The sweep below is the
-    /// evidence for the value, and the honesty about it:
+    /// **The value is chosen from this crate's own measurements, and is not an
+    /// upstream default.** An earlier version of this doc said it was "YOLOX's
+    /// own `--conf 0.25`". **No `--conf` flag exists**; the ONNX demo hardcodes
+    /// `score_thr = 0.1` (the brief's value) and its CLI flag is `-s/--score_thr`
+    /// defaulting to `0.3`. The justification has to stand on the numbers below.
     ///
-    /// | threshold | rows past it (3 images) | after NMS |
+    /// The counts are **two-class** — the boxes `detect` actually returns, which
+    /// is what this doc is about. An earlier version quoted the 80-class totals
+    /// here (3 / 1 / 9 at 0.25); those were not this function's output, and the
+    /// cats frame's three boxes were two cats and a sofa, of which `detect`
+    /// returns **none**.
+    ///
+    /// | threshold | two-class boxes (cats / desk / room) | total |
     /// |---|---|---|
-    /// | 0.05 | 222 | 44 |
-    /// | 0.10 | 149 | 26 |
-    /// | 0.20 | 105 | 15 |
-    /// | **0.25** | **98** | **13** |
-    /// | 0.30 | 89 | 11 |
-    /// | 0.50 | 55 | 9 |
+    /// | 0.05 – 0.20 | 1 / 0 / 2 | 3 |
+    /// | **0.25** | **0 / 0 / 2** | **2** |
+    /// | 0.30 | 0 / 0 / 2 | 2 |
+    /// | 0.40 – 0.50 | 0 / 0 / 1 | 1 |
     ///
-    /// **I cannot claim a measured precision for this number**, because the
-    /// three images have no ground-truth labels. What was checked is that every
-    /// surviving box corresponds to an object visible in the frame — done by
-    /// drawing the boxes and looking at them
-    /// (`research/yolox/compare_variants.py` writes the overlays). Above 0.25 the
-    /// count falls slowly, which says the real detections have a long tail rather
-    /// than a clean gap; below it the count grows quickly with small boxes.
+    /// So at 0.25 the detector returns **two boxes, both `person`, both on the
+    /// room frame** (scores 0.691 and 0.380), and those two are correct: drawn
+    /// and checked, they frame the standing person and the seated person.
+    ///
+    /// The step from 3 to 2 between 0.20 and 0.25 is the whole argument for the
+    /// value, and it is visible: the third box is a `person` scoring **0.2093**
+    /// on the cats frame whose rectangle covers *the entire image*. It is a
+    /// full-frame false positive on a photo containing no person at all. Above
+    /// 0.25 nothing further is lost until 0.40 (where one of the two real people
+    /// goes), so 0.25 sits at the low end of the band that keeps both correct
+    /// boxes and drops the spurious one.
+    ///
+    /// **What this measurement does not establish.** It is three images with no
+    /// ground-truth labels, so it can show that 0.25 rejects one identified false
+    /// positive and keeps two identified true positives; it cannot give a
+    /// precision or recall. The band 0.25–0.30 is flat on this sample, which
+    /// means the sample does not discriminate within it, and a labelled
+    /// desk-domain set could easily move the value.
+    ///
+    /// A second finding, which matters more than the threshold: **no `cell
+    /// phone` is detected at any threshold.** The strongest phone-class score
+    /// across the three images is **0.0052**, and the desk frame — which does
+    /// contain a phone — scores 0.0000. Whatever the phone signal becomes, it
+    /// will not come from this model on this evidence; see the report's concerns.
     ///
     /// # What the boxes mean
     ///
@@ -1266,10 +1359,11 @@ mod tests {
             );
         }
 
-        // A non-finite *class* logit is rejected too, and it needs its own case
+        // A non-finite *class* value is rejected too, and it needs its own case
         // because the class values never reach the box arithmetic: a NaN there
         // would otherwise pass silently through `finite_raw` as
-        // `sigmoid(-MAX_EXPONENT)` = 2.06e-9.
+        // `-MAX_EXPONENT`, giving a negative product that happens to be
+        // rejected for the wrong reason.
         let (detector, _) =
             detector_for_row(0, &row_for(0.5, PERSON_CLASS as usize, f32::NAN, [0.0; 4]));
         assert!(
@@ -1929,7 +2023,8 @@ mod tests {
         // not being tested at all.
         assert_eq!(
             SCORE_THRESHOLD, 0.25,
-            "YOLOX's own --conf default, and the value the calibration chose"
+            "chosen from this crate's two-class measurements, not an upstream \
+             default — there is no upstream --conf flag"
         );
 
         // A row scoring comfortably above the threshold, and one scoring between
@@ -2075,10 +2170,13 @@ mod tests {
     #[test]
     fn a_blank_tensor_yields_no_detections() {
         // The "the model saw nothing" case, and the one a real blank frame must
-        // reach: `blank_row` is objectness -40, so every row scores ~2e-18 and
-        // the class gate has nothing to admit. A zero-filled tensor would score
-        // 0.25 on all 3549 rows, so this also pins that the decode does not
-        // turn an empty prediction into a flood.
+        // reach. `blank_row` is now **all zeroes**, including the objectness, so
+        // every row's score is `0.0 * cls = 0.0` and all 3549 are rejected on
+        // score before the class gate is even consulted. (This comment used to
+        // say `blank_row` was "objectness -40, so every row scores ~2e-18" — that
+        // described the deleted sigmoid decode, where the objectness column was a
+        // *logit*. It is a probability now, and the reasoning below is the one
+        // that matches the code.)
         let frame = letterboxed_frame((10, 20, 30));
         let (detector, handle) = detector_returning(predictions_output(blank_predictions()));
         assert!(
@@ -2236,14 +2334,12 @@ mod tests {
 
     #[test]
     fn preprocessing_matches_an_external_build() {
-        // The unit tests above share one weakness and it is the weakness that
-        // let R39 through: they compare the tensor `preprocess` builds against
-        // expectations written from the *same* reading of the convention. A
-        // wrong convention moves both sides together and the suite stays green.
+        // An implementation cross-check, **not** a convention check — see R47
+        // below before reading anything into it.
         //
         // This prints a checksum of the tensor for a fixed synthetic frame.
         // `research/yolox/crosscheck_tensor.py` builds the same frame through the
-        // same pipeline independently in Python. Run it with `-- --nocapture`:
+        // same pipeline in Python. Run it with `-- --nocapture`:
         //
         // ```text
         // cargo test -p lockin-vision models::yolox::tests::preprocessing_matches_an_external_build -- --nocapture
@@ -2271,11 +2367,31 @@ mod tests {
         // content band, scale and remap positions all match exactly, which is
         // what makes this a rounding difference and not a geometric one.
         //
-        // That is the point of the exercise: two independent implementations of
-        // the regime agree on everything a wrong convention would have changed —
-        // the pad value, the colour order, the content band's extent, the resize
-        // mapping — and differ only in the last bits of accumulated float
-        // arithmetic.
+        // That is the point of the exercise: two implementations of the same
+        // stated regime agree on the pad value, the content band's extent and
+        // the resize mapping, and differ only in the last bits of accumulated
+        // float arithmetic.
+        //
+        // ## R47: what this test is *not*
+        //
+        // It is **not** an independent check of the *convention*, and an earlier
+        // version of this comment overstated it as one. The Python half
+        // hardcodes `PAD = 114.0` and raw `0–255` at `crosscheck_tensor.py:20`
+        // — the same reading, written by the same author — so it cannot
+        // corroborate the convention, only the implementation. And the
+        // assertions below move for `/255`, for mean/std and for a pad of 0 or
+        // 127, but **a channel swap moves none of them**: the tensor's shape is
+        // unchanged, its pad count is unchanged, and its mean over three planes
+        // is unchanged, because the frame's blue and green ramps are both
+        // 0..250 and swap into each other.
+        //
+        // So nothing in this test would catch a BGR↔RGB inversion on this
+        // fixture. What catches one is
+        // `preprocessing_letterboxes_to_416_with_pad_114_and_keeps_bgr_0_255`,
+        // whose frame is a *constant* `(10, 20, 30)` and which asserts the three
+        // planes are exactly `10.0`, `20.0` and `30.0` — three different values
+        // in a known order, which a swap reverses. The comment here said
+        // "colour order" before; that claim belonged to the other test.
         let frame = frame_with(1000, 700, |x, y| {
             (
                 (x % 251) as u8,
