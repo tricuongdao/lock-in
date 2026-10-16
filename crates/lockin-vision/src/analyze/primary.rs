@@ -19,27 +19,54 @@
 //!
 //! A selector holds one thing across calls: the box of the face it chose last
 //! time. `select` is handed a fresh slice with no identity attached to any box,
-//! so the incumbent is recognised by **geometry** — it is the face that
-//! overlaps the remembered box most, when that overlap is at least
-//! `INCUMBENT_IOU`. Slice *order* is never identity: `YuNet::detect` returns
-//! faces strongest-first and the scores jitter every frame, so index 0 this
-//! frame is routinely a different person next frame.
+//! so the incumbent is recognised by **geometry** — by **overlap** while the
+//! face is still where it was, and by **proximity** when it has moved too far in
+//! one tick for overlap to say anything. Slice *order* is never identity:
+//! `YuNet::detect` returns faces strongest-first and the scores jitter every
+//! frame, so index 0 this frame is routinely a different person next frame.
 //!
 //! In full, one call does this:
 //!
 //! 1. an empty slice answers `None` and leaves the incumbent alone — a detector
 //!    that misses for a tick has not said the wearer left, and `AwayFromDesk`
 //!    is the state machine's judgement (it counts faces, with its own dwell);
-//! 2. the incumbent is matched to the slice by maximum overlap, if any face
-//!    overlaps the remembered box by at least `INCUMBENT_IOU`;
-//! 3. the leader is the face the ranking puts first: largest area, ties to the
-//!    face nearer the frame centre, ties to the lower index;
-//! 4. the primary is the incumbent when one was matched and the leader is
-//!    either that same face or not more than `HYSTERESIS` times its area;
-//!    otherwise the primary is the leader — a challenger that is clearly larger
-//!    takes the role, and so does any face at all when the incumbent is gone;
-//! 5. the remembered box becomes the primary's box, so it tracks that face
+//! 2. the leader is the face the ranking puts first: largest area, ties to the
+//!    face nearer the frame centre, ties to the lower index. A box with no
+//!    usable geometry is not ranked at all, and a slice with no usable face has
+//!    no primary;
+//! 3. the incumbent is **continued** by the best-overlapping face, when one
+//!    overlaps its remembered box by at least `INCUMBENT_IOU`, and otherwise by
+//!    the face nearest that box's centre, when it is within `CONTINUATION_REACH`
+//!    box-sides of it;
+//! 4. a continuing face keeps the role unless the leader is a different face and
+//!    clearly larger — by `HYSTERESIS` — than **both** its own area now and the
+//!    area the role was held with last tick, so a face that momentarily shrinks
+//!    cannot lower the bar it has to clear;
+//! 5. with no continuation the role is **held, not free**: only a face clearly
+//!    larger than the remembered box takes it, and otherwise this tick has no
+//!    primary to report;
+//! 6. the remembered box becomes the primary's box, so it tracks that face
 //!    rather than drifting.
+//!
+//! # Where the role changes hands, in numbers
+//!
+//! For two 100-pixel boxes shifted `d` pixels apart the IoU is
+//! `(100 - d) / (100 + d)`: 53 px gives 0.307 and keeps the overlap match, 54 px
+//! gives 0.2987 and does not. So the *match* ends at about half a box width of
+//! motion per tick — and the *role* does not. From there to `CONTINUATION_REACH`
+//! (one box side) the nearest face continues it, and past that it is held.
+//! Measured at a desk and 5 Hz, one box side per tick is roughly half a metre
+//! per second of head motion: a lean costs the wearer nothing, and a move fast
+//! enough to break even that keeps the role rather than giving it away.
+//!
+//! Holding the role is the deliberate answer to an ambiguity geometry cannot
+//! settle: a face that has left the reach band may be the wearer, who moved very
+//! fast and settled, or someone else, who walked in after the wearer left. The
+//! two look identical. This module picks the answer that does not attribute a
+//! stranger's head pose to the wearer — no primary until something is clearly
+//! larger — and the state machine reads a present-`None` primary as
+//! `OtherPresent`, which is what the spec prescribes when the primary face is
+//! lost while faces remain. `AwayFromDesk` needs *zero* faces.
 //!
 //! # What the rule reads, and what it does not
 //!
@@ -77,13 +104,28 @@ const HYSTERESIS: f32 = 1.25;
 /// How much of the incumbent's last box a face must still overlap to be taken
 /// for that same face.
 ///
-/// Two people side by side overlap by about nothing, while the same person one
-/// tick later overlaps themselves heavily; `0.3` is the same "these are the same
-/// face" figure `YuNet`'s own suppression uses, and it tolerates a face that has
-/// moved by over half its own width or shrunk to 55% of its size between calls.
-/// A lower bar would let the role travel across the frame to a stranger; a
-/// higher one would orphan the incumbent whenever the wearer moved quickly.
+/// For two boxes of the same size that is a shift of just over half a box
+/// width — 53 pixels for a 100-pixel box, whose IoU is `(100 - d) / (100 + d)`.
+/// Motion past it is not a lost identity, only a lost *overlap*:
+/// `CONTINUATION_REACH` takes over from there, so this constant decides which
+/// of the two mechanisms recognises the wearer, not whether they are
+/// recognised. A lower bar would let the role travel to a stranger standing
+/// beside the wearer; a higher one would leave more of an ordinary lean to the
+/// weaker, purely positional rule.
 const INCUMBENT_IOU: f32 = 0.3;
+
+/// How far a face may be from the incumbent's last box and still continue it,
+/// in units of that box's longer side.
+///
+/// The fallback for motion too fast for `INCUMBENT_IOU`: a face that was in one
+/// place last tick and is a box width away this tick is still best explained as
+/// that same face moving, and the alternative — treating it as gone — would drop
+/// the primary on any quick lean. At 5 Hz one box side per tick is about half a
+/// metre per second of head motion at a desk, well past a lean and short of
+/// someone walking out of frame. Past it the role is held rather than given
+/// away: see the module docs for why that is the honest answer and not a
+/// transfer.
+const CONTINUATION_REACH: f32 = 1.0;
 
 /// The frame size [`PrimarySelector::new`] assumes, in pixels: the reference
 /// webcam frame the synthetic source generates and every fixture uses.
@@ -96,9 +138,10 @@ const REFERENCE_FRAME: (u32, u32) = (640, 480);
 /// with.
 #[derive(Debug)]
 pub struct PrimarySelector {
-    /// The box of the face this selector chose on its last non-empty call, in
-    /// frame coordinates. `None` until then, and still `None` after a call with
-    /// no faces — a dropout is not a departure.
+    /// The box of the face this selector chose on its last call that had a
+    /// primary, in frame coordinates. `None` until then, and unchanged by a
+    /// call with no faces, a call with nothing usable to rank, and a call whose
+    /// role is held by a face that is not on screen.
     incumbent: Option<Rect>,
     /// The point "proximity to the frame centre" is measured from.
     centre: (f32, f32),
@@ -130,89 +173,133 @@ impl PrimarySelector {
         }
     }
 
-    /// Chooses the primary face in `faces`, returning its index in that slice —
-    /// or `None` when there is no face to choose.
+    /// Chooses the primary face in `faces`, returning its index in that slice.
+    ///
+    /// `None` means this tick has no primary, and there are three ways to get
+    /// there: no faces at all, no face whose box has usable geometry, and a role
+    /// held by a face that is not on screen. In all three the incumbent is left
+    /// exactly as it was, so the next frame that does have a primary is matched
+    /// against the last box the selector believed in.
     ///
     /// The index is a position in the slice that was passed, not an identity:
-    /// the caller re-derives the face from it. Every call updates the
-    /// remembered box, so the selector tracks a face rather than a position,
-    /// and an empty slice is the one call that changes nothing.
+    /// the caller re-derives the face from it.
     pub fn select(&mut self, faces: &[FaceBox]) -> Option<usize> {
-        // No faces is not a decision. `None` says there is no primary; the
-        // incumbent stays where it is, because one missed detection is not the
-        // wearer leaving the desk. `AwayFromDesk` is the state machine's to
-        // judge — it counts faces and applies its own dwell — and a selector
-        // that cleared itself on every dropout would hand the role to whoever
-        // else is in frame the first time the wearer blinked.
+        // No faces is not a decision. The incumbent stays where it is, because
+        // one missed detection is not the wearer leaving the desk.
+        // `AwayFromDesk` is the state machine's to judge — it counts faces and
+        // applies its own dwell — and a selector that cleared itself on every
+        // dropout would hand the role to whoever else is in frame the first time
+        // the wearer blinked.
         if faces.is_empty() {
             return None;
         }
 
-        let incumbent = self.match_incumbent(faces);
-        let leader = self.top_ranked(faces);
+        // Nothing usable to rank is the same kind of non-decision: a slice of
+        // boxes whose geometry is not a number cannot produce a primary, and it
+        // must not clear the role the previous frame established.
+        let leader = self.top_ranked(faces)?;
 
-        let chosen = match incumbent {
-            // A face in this slice continues the incumbent, so it keeps the
-            // role unless the leader is a *different* face and clearly larger.
-            // A challenger of exactly `HYSTERESIS` times the incumbent's area
-            // does not take it: ties go to stability.
-            Some(incumbent) if incumbent != leader => {
-                if area(&faces[leader].rect) > area(&faces[incumbent].rect) * HYSTERESIS {
-                    leader
+        let chosen = match self.continuation(faces) {
+            // A face continues the incumbent. It keeps the role unless the
+            // leader is a *different* face and clearly larger than the area the
+            // role is held with — the larger of that face's area now and the
+            // remembered box's, so a face which momentarily shrinks cannot lower
+            // the bar it has to clear. A challenger of exactly `HYSTERESIS`
+            // times that area does not take it: ties go to stability.
+            Some((holder, remembered)) => {
+                let bar = area(&faces[holder].rect).max(area(&remembered));
+                if holder == leader || area(&faces[leader].rect) <= bar * HYSTERESIS {
+                    holder
                 } else {
-                    incumbent
+                    leader
                 }
             }
-            // The incumbent is the leader as well: it is still the largest
-            // face, or at least as well placed as any other, so there is
-            // nothing to weigh.
-            Some(incumbent) => incumbent,
-            // No face in this slice resembles the incumbent, which means it
-            // left the frame — the choice is free.
-            None => leader,
+            // No face in this slice is plausibly the incumbent, so the role is
+            // held by a face that is not on screen. It is **not** free: only a
+            // face clearly larger than the box holding it takes the role, and
+            // otherwise there is no primary to report this tick.
+            None => match self.incumbent {
+                Some(held) if area(&faces[leader].rect) <= area(&held) * HYSTERESIS => return None,
+                _ => leader,
+            },
         };
 
         // The remembered box becomes the chosen face's *current* box, so it
-        // follows that face as it moves. Only an empty slice skips this.
+        // follows that face as it moves. An empty slice, an unusable slice and a
+        // held role all return before this.
         self.incumbent = Some(faces[chosen].rect);
         Some(chosen)
     }
 
-    /// The face that continues the incumbent, if one does.
+    /// The face that continues the incumbent, and the box the role is held
+    /// with, if a face does.
     ///
-    /// The face overlapping the remembered box **most**, provided that overlap
-    /// is at least `INCUMBENT_IOU`. The best overlap rather than the first one
-    /// over the bar: a detection that splits in two would otherwise hand the
-    /// role to whichever half the detector happened to list first, and the
-    /// slice's order is not identity — `YuNet::detect` returns faces
-    /// strongest-first and the scores jitter every frame.
-    fn match_incumbent(&self, faces: &[FaceBox]) -> Option<usize> {
+    /// Overlap first: the face overlapping the remembered box **most**,
+    /// provided that overlap is at least `INCUMBENT_IOU`. The best overlap
+    /// rather than the first one over the bar, because a detection that splits
+    /// in two would otherwise hand the role to whichever half the detector
+    /// happened to list first, and the slice's order is not identity.
+    ///
+    /// With no overlap worth the name — the face moved more than half its own
+    /// width in one tick — proximity takes over: the face nearest the remembered
+    /// box's centre, provided it is within `CONTINUATION_REACH` box-sides of it.
+    /// A stranger across the frame is not within reach, and neither is a box
+    /// whose geometry has no centre.
+    fn continuation(&self, faces: &[FaceBox]) -> Option<(usize, Rect)> {
         let remembered = self.incumbent?;
 
-        let mut matched: Option<(usize, f32)> = None;
+        let mut overlapped: Option<(usize, f32)> = None;
+        let mut nearest: Option<(usize, f32)> = None;
         for (index, face) in faces.iter().enumerate() {
+            if !usable(&face.rect) {
+                continue;
+            }
+
             let overlap = remembered.iou(&face.rect);
-            let best_so_far = match matched {
+            let better = match overlapped {
                 None => true,
                 Some((_, best)) => overlap > best,
             };
             // A NaN overlap fails the threshold and is skipped, which is what a
             // box with no usable geometry deserves; a face that is not the
             // incumbent must never inherit the role by accident.
-            if overlap >= INCUMBENT_IOU && best_so_far {
-                matched = Some((index, overlap));
+            if overlap >= INCUMBENT_IOU && better {
+                overlapped = Some((index, overlap));
+            }
+
+            let separation = separation_squared(&remembered, &face.rect);
+            let closer = match nearest {
+                None => true,
+                Some((_, best)) => separation < best,
+            };
+            if closer {
+                nearest = Some((index, separation));
             }
         }
-        matched.map(|(index, _)| index)
+
+        if let Some((index, _)) = overlapped {
+            return Some((index, remembered));
+        }
+        let reach = CONTINUATION_REACH * remembered.w.max(remembered.h);
+        nearest
+            .filter(|(_, separation)| *separation <= reach * reach)
+            .map(|(index, _)| (index, remembered))
     }
 
-    /// The index of the face the ranking puts first, on a slice that is not
-    /// empty.
-    fn top_ranked(&self, faces: &[FaceBox]) -> usize {
-        let mut leader = 0;
-        for index in 1..faces.len() {
-            if self.outranks(&faces[index], &faces[leader]) {
-                leader = index;
+    /// The index of the face the ranking puts first, or `None` when no face has
+    /// geometry the ranking can read.
+    fn top_ranked(&self, faces: &[FaceBox]) -> Option<usize> {
+        let mut leader: Option<usize> = None;
+        for (index, face) in faces.iter().enumerate() {
+            if !usable(&face.rect) {
+                continue;
+            }
+            let outranks = match leader {
+                Some(best) => self.outranks(face, &faces[best]),
+                None => true,
+            };
+            if outranks {
+                leader = Some(index);
             }
         }
         leader
@@ -222,10 +309,8 @@ impl PrimarySelector {
     /// frame centre, and otherwise the earlier index, because a face that
     /// outranks nothing keeps the place it was found in.
     ///
-    /// The area comparison is two steps rather than one so that a NaN area
-    /// *loses* instead of winning by accident: a NaN is unequal to everything,
-    /// and every ordering comparison against it is false, so the inequality
-    /// test routes it to a comparison it cannot pass.
+    /// Both boxes have been through `usable`, so both areas and both distances
+    /// are real numbers and neither comparison can be swallowed by a NaN.
     fn outranks(&self, candidate: &FaceBox, leader: &FaceBox) -> bool {
         let candidate_area = area(&candidate.rect);
         let leader_area = area(&leader.rect);
@@ -258,50 +343,82 @@ impl Default for PrimarySelector {
     }
 }
 
+/// Whether a box's geometry is a box: finite coordinates, non-negative extents.
+///
+/// The same invariants `YuNet::decode` states in its own `debug_assert`, and a
+/// box that violates them is not ranked, not matched and not continued no matter
+/// where in the slice it sits. It is reachable in principle: `clamp` propagates
+/// a NaN rather than rejecting it, so a decode handed a garbage tensor produces
+/// rects with no usable geometry, and every crop derived from one would be
+/// garbage in turn. Filtering here is what makes the ranking total.
+fn usable(rect: &Rect) -> bool {
+    rect.x.is_finite()
+        && rect.y.is_finite()
+        && rect.w.is_finite()
+        && rect.h.is_finite()
+        && rect.w >= 0.0
+        && rect.h >= 0.0
+}
+
 /// A box's area in square frame pixels.
 ///
 /// "Largest box" means this and not the longer side: a 130x130 face is bigger
 /// than a 90x160 one, and a rule that compared the longest edge would say the
-/// opposite. Detector extents are non-negative — `YuNet::decode` clamps every
-/// box into the frame — so this is never a negative area that could win a
-/// comparison by a double negation, and a box that somehow carried one ranks
-/// below every real face.
+/// opposite. Every box that reaches a comparison has been through `usable`, so
+/// both extents are finite and non-negative, and this is never a negative or a
+/// not-a-number area that could win by a double negation.
 fn area(rect: &Rect) -> f32 {
     rect.w * rect.h
+}
+
+/// Squared distance between two boxes' centres.
+///
+/// Squared because only the *order* of two of these is ever read, and because
+/// the reach test compares it against a squared reach.
+fn separation_squared(a: &Rect, b: &Rect) -> f32 {
+    let ((ax, ay), (bx, by)) = (a.center(), b.center());
+    let (dx, dy) = (ax - bx, ay - by);
+    dx * dx + dy * dy
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// A face whose box is a `size`-square with its top-left at `(x, y)`.
+    /// A face with the box a test chose, whatever that geometry is.
     ///
     /// The landmarks are zeroes and the confidence is uniform: the selector
     /// ranks boxes, so a fixture that varied either would be testing a term the
     /// rule does not have.
-    fn face(x: f32, y: f32, size: f32) -> FaceBox {
-        box_face(x, y, size, size)
-    }
-
-    /// A face whose box is `w` by `h` with its top-left at `(x, y)`.
-    fn box_face(x: f32, y: f32, w: f32, h: f32) -> FaceBox {
+    fn any_face(rect: Rect) -> FaceBox {
         FaceBox {
-            rect: Rect { x, y, w, h },
+            rect,
             score: 0.9,
             landmarks: [(0.0, 0.0); 5],
         }
     }
 
+    /// A face whose box is `w` by `h` with its top-left at `(x, y)`.
+    fn box_face(x: f32, y: f32, w: f32, h: f32) -> FaceBox {
+        any_face(Rect { x, y, w, h })
+    }
+
+    /// A face whose box is a `size`-square with its top-left at `(x, y)`.
+    fn face(x: f32, y: f32, size: f32) -> FaceBox {
+        box_face(x, y, size, size)
+    }
+
     #[test]
     fn largest_face_wins_when_sizes_differ_clearly() {
-        // The small face is nearer the frame centre — its centre is (140, 140)
-        // against (500, 180) for a reference frame centre of (320, 240) — it is
-        // listed first, and the detector is more confident about it. The large
-        // face wins anyway, because the rule is "largest box" and nothing else
-        // in this module outranks area.
+        // The small face is the better-placed of the two: its centre is
+        // (290, 240), 30 px from the reference frame centre (320, 240), where
+        // the large one's is (500, 180), 180 px across and 60 px down. It is
+        // also listed first, and the detector is more confident about it, and it
+        // loses anyway, because the rule is "largest box" and nothing else in
+        // this module outranks area.
         let small = FaceBox {
             score: 0.99,
-            ..face(100.0, 100.0, 80.0)
+            ..face(250.0, 200.0, 80.0)
         };
         let large = FaceBox {
             score: 0.80,
@@ -309,6 +426,18 @@ mod tests {
         };
         assert_eq!(area(&small.rect), 6400.0);
         assert_eq!(area(&large.rect), 25600.0, "four times the small face");
+        assert_eq!(small.rect.center(), (290.0, 240.0));
+        assert_eq!(large.rect.center(), (500.0, 180.0));
+
+        // The premise, so that "the large box won" is a statement about area:
+        // 900 is nearer the frame centre than 36000, so a rule that preferred
+        // the centre — or the confidence — would answer 0.
+        let to_centre = |rect: &Rect| {
+            let (x, y) = rect.center();
+            (x - 320.0).powi(2) + (y - 240.0).powi(2)
+        };
+        assert_eq!(to_centre(&small.rect), 900.0);
+        assert_eq!(to_centre(&large.rect), 36000.0);
 
         let mut selector = PrimarySelector::new();
         assert_eq!(
@@ -317,10 +446,17 @@ mod tests {
             "the 160 px box is at index 1 and wins on area"
         );
 
-        // Permuted, and on a fresh selector, the same box wins: the answer is a
-        // box, and the index merely says where in *this* slice it was found.
+        // The other order, on a fresh selector: the same box wins, so the choice
+        // is a property of the geometry and not of the position. The pair is
+        // what rules out an index preference — "the first face wins" fails the
+        // assertion above, "the last face wins" fails this one.
         let mut selector = PrimarySelector::new();
-        assert_eq!(selector.select(&[large, small]), Some(0));
+        let chosen = selector.select(&[large, small]).expect("a primary");
+        assert_eq!(
+            [large, small][chosen].rect,
+            large.rect,
+            "the same box, listed first this time"
+        );
     }
 
     #[test]
@@ -332,17 +468,26 @@ mod tests {
         let near = face(280.0, 160.0, 80.0);
         let far = face(520.0, 160.0, 80.0);
         assert_eq!(area(&near.rect), area(&far.rect), "equal areas");
+        assert_eq!(near.rect.center(), (320.0, 200.0));
+        assert_eq!(far.rect.center(), (560.0, 200.0));
 
         // The nearer box is listed second, so "first in the slice" is not the
         // answer: index 1 is the box 40 px from the centre.
         let mut selector = PrimarySelector::new();
         assert_eq!(selector.select(&[far, near]), Some(1));
 
-        // And on a fresh selector the same box wins from the other order, so
-        // which face is primary is a property of the geometry rather than of
-        // the slice it arrived in.
+        // The other order, on a fresh selector, and the weaker half of the pair:
+        // on its own this assertion is satisfied by an area-only rule that
+        // breaks ties towards the earlier face, which is why the assertion above
+        // exists. Together they leave the tie-break as the only rule that
+        // answers both.
         let mut selector = PrimarySelector::new();
-        assert_eq!(selector.select(&[near, far]), Some(0));
+        let chosen = selector.select(&[near, far]).expect("a primary");
+        assert_eq!(
+            [near, far][chosen].rect,
+            near.rect,
+            "the same box, listed first this time"
+        );
     }
 
     #[test]
@@ -390,14 +535,24 @@ mod tests {
         let big = face(300.0, 100.0, 200.0);
         assert_eq!(selector.select(&[a, big]), Some(1), "big is at index 1");
 
-        // And once it holds the role it keeps it against `a` in either order,
-        // which is the same stickiness applied to the new incumbent.
+        // And once `big` holds the role it keeps it. The next challenger is
+        // 210² = 44100, a mere 1.10x `big`, and it is listed *first*, so a
+        // selector that had not remembered `big` would answer 0 here.
+        let nearly_big = face(300.0, 100.0, 210.0);
+        assert!(area(&nearly_big.rect) > area(&big.rect));
+        assert!(area(&nearly_big.rect) < area(&big.rect) * 1.25);
         assert_eq!(
-            selector.select(&[big, a]),
+            selector.select(&[nearly_big, big]),
+            Some(1),
+            "big is at index 1 here"
+        );
+        // And the other way round, where the incumbent is the larger of the two
+        // and only an area-blind rule could answer 1.
+        assert_eq!(
+            selector.select(&[big, nearly_big]),
             Some(0),
             "big is at index 0 here"
         );
-        assert_eq!(selector.select(&[a, big]), Some(1));
     }
 
     #[test]
@@ -411,6 +566,11 @@ mod tests {
         let square = box_face(30.0, 300.0, 130.0, 130.0);
         assert_eq!(area(&tall.rect), 14400.0);
         assert_eq!(area(&square.rect), 16900.0, "the bigger box, by area");
+        assert_eq!(
+            tall.rect.center(),
+            (320.0, 240.0),
+            "the tall box is the centred one"
+        );
 
         let mut selector = PrimarySelector::new();
         assert_eq!(
@@ -465,6 +625,7 @@ mod tests {
         let corner = face(20.0, 20.0, 100.0);
         let middle = face(270.0, 190.0, 100.0);
         assert_eq!(area(&corner.rect), area(&middle.rect));
+        assert_eq!(middle.rect.center(), (320.0, 240.0));
 
         let mut selector = PrimarySelector::new();
         assert_eq!(
@@ -526,40 +687,292 @@ mod tests {
     }
 
     #[test]
-    fn the_incumbent_is_dropped_when_it_leaves_the_frame() {
-        // The wearer leaves. Neither remaining box resembles their last box —
-        // both overlaps are zero — so the role is free and the ranking decides:
-        // the larger of the two, which the slice lists *second*.
+    fn overlap_beats_proximity_and_the_bar_decides_which_applies() {
+        // The two ways a face is recognised can disagree about which face it
+        // is, and pinning that disagreement is what fixes the threshold itself
+        // rather than only the boundaries around it.
+        //
+        // The wearer's remembered box is 200x200 at (100, 100): area 40000,
+        // centre (200, 200). Against it:
+        //   * `overlapped` — 150x150 at (200, 150) — shares 15000 px², IoU
+        //     15000/47500 = 0.316, and its centre is 6250 px² away;
+        //   * `near_miss` — 150x150 at (250, 150) — shares 7500 px², IoU
+        //     7500/55000 = 0.136, and its centre is 16250 px² away;
+        //   * `centred` — 60x60 at (170, 170) — sits exactly on the remembered
+        //     box's centre, separation 0, but shares only 3600/40000 = 0.09.
+        let wearer = face(100.0, 100.0, 200.0);
+        let overlapped = face(200.0, 150.0, 150.0);
+        let near_miss = face(250.0, 150.0, 150.0);
+        let centred = face(170.0, 170.0, 60.0);
+        assert_eq!(wearer.rect.iou(&overlapped.rect), 15000.0 / 47500.0);
+        assert_eq!(wearer.rect.iou(&near_miss.rect), 7500.0 / 55000.0);
+        assert_eq!(wearer.rect.iou(&centred.rect), 0.09);
+        assert_eq!(separation_squared(&wearer.rect, &overlapped.rect), 6250.0);
+        assert_eq!(separation_squared(&wearer.rect, &near_miss.rect), 16250.0);
+        assert_eq!(separation_squared(&wearer.rect, &centred.rect), 0.0);
+        assert!(area(&overlapped.rect) > area(&centred.rect));
+
+        // Both candidates are above the bar, so the better *overlap* wins even
+        // though the other one is exactly where the wearer was: overlapping the
+        // remembered box is a stronger claim than merely sitting at its centre.
+        // Raising the bar past 0.316, or putting proximity first, answers 1.
+        let mut selector = PrimarySelector::new();
+        assert_eq!(selector.select(&[wearer]), Some(0));
+        assert_eq!(
+            selector.select(&[overlapped, centred]),
+            Some(0),
+            "overlapped at index 0 is the better match"
+        );
+
+        // Now the best overlap is *below* the bar — 0.136 against 0.3 — so
+        // nothing matches and proximity decides, keeping the role on the face at
+        // the remembered centre. A bar low enough to admit 0.136 would match
+        // `near_miss` instead and answer 0.
+        let mut selector = PrimarySelector::new();
+        assert_eq!(selector.select(&[wearer]), Some(0));
+        assert_eq!(
+            selector.select(&[near_miss, centred]),
+            Some(1),
+            "past the bar, the nearest face at index 1 continues the incumbent"
+        );
+    }
+
+    #[test]
+    fn a_transient_shrink_does_not_lower_the_bar() {
+        // The bar a challenger must clear is the larger of the incumbent's area
+        // *now* and the area the role was held with last tick. Here the wearer's
+        // box shrinks from 100² = 10000 to 80² = 6400 — leaning back, still
+        // overlapping the remembered box by 0.64 — while a rival holds at
+        // 90² = 8100. Against the shrunken area alone the rival would take the
+        // role; against the remembered area it cannot.
         let wearer = face(100.0, 100.0, 100.0);
-        let small = face(300.0, 300.0, 100.0);
-        let larger = box_face(450.0, 300.0, 110.0, 100.0);
-        assert_eq!(wearer.rect.iou(&small.rect), 0.0);
-        assert_eq!(wearer.rect.iou(&larger.rect), 0.0);
+        let shrunken = face(110.0, 110.0, 80.0);
+        let rival = face(400.0, 100.0, 90.0);
+        assert_eq!(wearer.rect.iou(&shrunken.rect), 0.64, "still the same face");
+        assert_eq!(area(&shrunken.rect), 6400.0);
+        assert_eq!(area(&rival.rect), 8100.0);
         assert!(
-            area(&larger.rect) > area(&small.rect),
-            "the premise: the second box is the larger one"
+            area(&rival.rect) > area(&shrunken.rect) * 1.25,
+            "8100 > 8000: the shrunken area alone would let the rival in"
         );
         assert!(
-            area(&larger.rect) < area(&small.rect) * 1.25,
-            "and it is inside the hysteresis window, so a selector that still \
-             held the wearer's role for `small` would keep holding it"
+            area(&rival.rect) < area(&wearer.rect) * 1.25,
+            "8100 < 12500: the remembered area does not"
         );
 
         let mut selector = PrimarySelector::new();
         assert_eq!(selector.select(&[wearer]), Some(0));
         assert_eq!(
-            selector.select(&[small, larger]),
+            selector.select(&[rival, shrunken]),
             Some(1),
-            "with the incumbent gone the choice is free: index 1, the larger box"
+            "the shrunken wearer at index 1 keeps the role"
+        );
+    }
+
+    #[test]
+    fn a_face_moving_a_half_box_width_keeps_the_role() {
+        // Where the role changes hands, in numbers, for two 100-px boxes: the
+        // IoU is (100 - d) / (100 + d), so a shift of 53 px gives 0.307 and
+        // keeps the overlap match while 54 px gives 0.2987 and does not — and
+        // one box side, 100 px, is the reach of the proximity fallback that
+        // takes over. Each band is pinned against a rival 1.10x the wearer's
+        // area, inside the hysteresis window, so "the wearer kept the role" is
+        // only the answer if the wearer was recognised at all.
+        let wearer = face(100.0, 100.0, 100.0);
+        let rival = face(400.0, 300.0, 105.0); // 11025 = 1.1025x the wearer
+        assert!(area(&rival.rect) < area(&wearer.rect) * 1.25);
+
+        let shifted = |dx: f32| face(100.0 + dx, 100.0, 100.0);
+        let inside_the_bar = shifted(53.0);
+        let past_the_bar = shifted(54.0);
+        let at_the_reach = shifted(100.0);
+        let past_the_reach = shifted(101.0);
+        // A diagonal step of (60, 60): a squared separation of 7200 is inside
+        // the squared reach of 10000, while a Manhattan separation of 120 would
+        // be outside it.
+        let diagonal = face(160.0, 160.0, 100.0);
+
+        assert_eq!(wearer.rect.iou(&inside_the_bar.rect), 4700.0 / 15300.0);
+        assert!(wearer.rect.iou(&inside_the_bar.rect) >= 0.3);
+        assert_eq!(wearer.rect.iou(&past_the_bar.rect), 4600.0 / 15400.0);
+        assert!(
+            wearer.rect.iou(&past_the_bar.rect) < 0.3,
+            "the overlap match really has ended here"
+        );
+        // Separation is what the fallback reads from this point on: 54 px is
+        // 0.54 of a box side and inside the reach, 101 px is not, and the
+        // diagonal step is inside it on both axes at once.
+        assert_eq!(separation_squared(&wearer.rect, &past_the_bar.rect), 2916.0);
+        assert_eq!(
+            separation_squared(&wearer.rect, &at_the_reach.rect),
+            10000.0
+        );
+        assert_eq!(
+            separation_squared(&wearer.rect, &past_the_reach.rect),
+            10201.0
+        );
+        assert_eq!(separation_squared(&wearer.rect, &diagonal.rect), 7200.0);
+        let manhattan = |rect: &Rect| {
+            let ((ax, ay), (bx, by)) = (wearer.rect.center(), rect.center());
+            (ax - bx).abs() + (ay - by).abs()
+        };
+        assert!(
+            manhattan(&diagonal.rect) > 100.0,
+            "the premise: a Manhattan measure would put the diagonal step \
+             outside the reach, so this band pins the metric as well"
         );
 
-        // And the wearer coming back does not get the role back for free: the
-        // selector no longer holds their box, and the face now wearing the role
-        // is not out-sized by them, so it keeps it.
+        for (band, moved, expected) in [
+            ("inside the overlap bar", inside_the_bar, Some(1)),
+            ("past the bar, inside the reach", past_the_bar, Some(1)),
+            ("exactly at the reach", at_the_reach, Some(1)),
+            ("a diagonal step inside the reach", diagonal, Some(1)),
+            ("past the reach, role held", past_the_reach, None),
+        ] {
+            let mut selector = PrimarySelector::new();
+            assert_eq!(selector.select(&[wearer]), Some(0));
+            assert_eq!(
+                selector.select(&[rival, moved]),
+                expected,
+                "{band}: the rival is at index 0 and the moved wearer at index 1"
+            );
+        }
+    }
+
+    #[test]
+    fn the_moving_incumbent_is_followed() {
+        // No fixture above moves the incumbent, which is exactly what storing
+        // its *current* box after every call is for: a selector that kept only
+        // its first box would lose a wearer who walked across the frame, because
+        // every frame is compared against the last box it stored.
+        //
+        // The wearer steps 40 px per frame — an IoU of 0.4286 between
+        // consecutive boxes, comfortably inside the overlap bar — for six
+        // frames, 240 px in all, well past the one-box-side reach. A rival 1.10x
+        // its area is listed *first* every frame, so the answer is the wearer's
+        // index only if the role is kept and the box is tracked.
+        const STEP: f32 = 40.0;
+        const STEPS: usize = 6;
+        assert!(
+            STEP * STEPS as f32 > 100.0,
+            "the walk must exceed one box side, or a selector that never \
+             updated its remembered box could follow it anyway"
+        );
+
+        let rival = face(450.0, 300.0, 105.0);
+        let first = face(100.0, 100.0, 100.0);
+        assert!(area(&rival.rect) < area(&first.rect) * 1.25);
+
+        let mut selector = PrimarySelector::new();
+        assert_eq!(selector.select(&[first]), Some(0), "the wearer alone");
+
+        let mut previous = first;
+        for step in 1..=STEPS {
+            let moved = face(100.0 + STEP * step as f32, 100.0, 100.0);
+            assert!(
+                previous.rect.iou(&moved.rect) >= 0.3,
+                "step {step}: consecutive boxes overlap enough to match"
+            );
+            assert_eq!(
+                selector.select(&[rival, moved]),
+                Some(1),
+                "step {step}: the wearer at index 1 still holds the role"
+            );
+            previous = moved;
+        }
+    }
+
+    #[test]
+    fn an_unmatched_tick_holds_the_role_instead_of_handing_it_to_a_stranger() {
+        // The wearer leaves the frame. A colleague is present and *is* the
+        // largest face, but at 105² = 11025 it is under 1.25x the wearer's
+        // 10000, and it is nowhere near where the wearer was — so the role is
+        // held by a face that is not on screen and this tick has no primary. A
+        // rule that ranked the slice by area whenever the incumbent could not be
+        // found would hand the role over here, with no hysteresis at all.
+        let wearer = face(100.0, 100.0, 100.0);
+        let colleague = face(450.0, 60.0, 100.0);
+        let stranger = face(500.0, 300.0, 105.0);
+        assert!(
+            area(&stranger.rect) < area(&wearer.rect) * 1.25,
+            "11025 < 12500: the bar is the *remembered* box's area"
+        );
+        assert_eq!(wearer.rect.iou(&stranger.rect), 0.0, "nowhere near");
+        assert!(
+            separation_squared(&wearer.rect, &stranger.rect) > 100.0 * 100.0,
+            "and outside the reach, which is what makes it a stranger"
+        );
+        assert!(separation_squared(&wearer.rect, &colleague.rect) > 100.0 * 100.0);
+
+        let mut selector = PrimarySelector::new();
+        assert_eq!(selector.select(&[wearer]), Some(0));
         assert_eq!(
-            selector.select(&[wearer, small, larger]),
+            selector.select(&[stranger, colleague]),
+            None,
+            "the role is held: the larger face at index 0 does not take it"
+        );
+
+        // The wearer reappearing before anything takes the role gets it back,
+        // because the role was held rather than given away.
+        assert_eq!(
+            selector.select(&[wearer]),
+            Some(0),
+            "the wearer is still the incumbent"
+        );
+
+        // A face that *is* clearly larger does take the held role, and then
+        // keeps it like any other incumbent.
+        let giant = face(500.0, 300.0, 130.0); // 16900 > 12500
+        assert!(area(&giant.rect) > area(&wearer.rect) * 1.25);
+        assert_eq!(
+            selector.select(&[giant, colleague]),
+            Some(0),
+            "giant is at index 0"
+        );
+        assert_eq!(
+            selector.select(&[colleague, giant]),
+            Some(1),
+            "giant is at index 1"
+        );
+    }
+
+    #[test]
+    fn a_face_that_takes_the_held_role_keeps_it_against_the_old_wearer() {
+        // The role passes to a face that is clearly larger than the remembered
+        // box: 130x100 = 13000 against 10000, over the 1.25 bar. From then on
+        // that face *is* the incumbent, so a wearer who comes back is a
+        // challenger like any other — and 118² = 13924 is larger than the new
+        // holder's area while staying inside its 1.25 window, so the role is not
+        // reclaimed. A selector with no memory of the holder would answer 0 for
+        // the returning, largest face; the holder is at index 2.
+        let wearer = face(100.0, 100.0, 100.0);
+        let colleague = face(300.0, 300.0, 100.0);
+        let successor = box_face(450.0, 300.0, 130.0, 100.0);
+        let returning = face(100.0, 100.0, 118.0);
+        assert!(
+            area(&successor.rect) > area(&wearer.rect) * 1.25,
+            "13000 > 12500: it takes the held role"
+        );
+        assert!(
+            area(&returning.rect) > area(&successor.rect),
+            "13924 > 13000: the returning wearer is the largest face"
+        );
+        assert!(
+            area(&returning.rect) < area(&successor.rect) * 1.25,
+            "13924 < 16250: and still inside the window"
+        );
+
+        let mut selector = PrimarySelector::new();
+        assert_eq!(selector.select(&[wearer]), Some(0));
+        assert_eq!(
+            selector.select(&[colleague, successor]),
+            Some(1),
+            "the successor at index 1 takes the held role"
+        );
+        assert_eq!(
+            selector.select(&[returning, colleague, successor]),
             Some(2),
-            "the larger box at index 2 still holds the role"
+            "the successor at index 2 keeps it"
         );
     }
 
@@ -590,6 +1003,72 @@ mod tests {
             selector.select(&[b, a]),
             Some(1),
             "a held the role across the dropout; b, at index 0, does not take it"
+        );
+    }
+
+    #[test]
+    fn a_non_finite_box_is_never_the_primary() {
+        // A decode handed a garbage tensor produces boxes with no usable
+        // geometry — `clamp` propagates a NaN rather than rejecting it — and
+        // `YuNet::decode`'s own invariants say the extents are non-negative.
+        // Such a box is not ranked, not matched and not continued, wherever in
+        // the slice it sits. Before this, one listed first could hold the role
+        // forever: its area is not a number, so nothing could out-rank it, and
+        // nothing could displace it either.
+        let nan_origin = any_face(Rect {
+            x: f32::NAN,
+            y: 100.0,
+            w: 90.0,
+            h: 90.0,
+        });
+        let nan_extent = any_face(Rect {
+            x: 100.0,
+            y: 100.0,
+            w: f32::NAN,
+            h: 80.0,
+        });
+        let infinite = any_face(Rect {
+            x: 100.0,
+            y: 100.0,
+            w: f32::INFINITY,
+            h: 80.0,
+        });
+        let negative = any_face(Rect {
+            x: 100.0,
+            y: 100.0,
+            w: -120.0,
+            h: -120.0,
+        });
+        let real = face(300.0, 200.0, 100.0);
+        assert!(
+            area(&negative.rect) > area(&real.rect),
+            "the premise: a double negative is a *positive* nominal area of \
+             14400, larger than the real face's 10000 — only the extent \
+             invariant keeps it out of the ranking"
+        );
+
+        for (name, broken) in [
+            ("a NaN origin", nan_origin),
+            ("a NaN extent", nan_extent),
+            ("an infinite extent", infinite),
+            ("negative extents", negative),
+        ] {
+            let mut selector = PrimarySelector::new();
+            assert_eq!(
+                selector.select(&[broken, real]),
+                Some(1),
+                "{name}: the real face at index 1 is the primary"
+            );
+        }
+
+        // A slice with nothing usable in it has no primary, and the role is
+        // still free for the next frame that has one.
+        let mut selector = PrimarySelector::new();
+        assert_eq!(selector.select(&[nan_origin, infinite, negative]), None);
+        assert_eq!(
+            selector.select(&[real]),
+            Some(0),
+            "a usable face still takes the role"
         );
     }
 
@@ -643,13 +1122,16 @@ mod tests {
         let mut reference = PrimarySelector::new();
         assert_eq!(reference.select(&[left, right]), Some(0));
 
-        // A frame with no pixels has its centre at the origin rather than a
-        // division by zero or a panic, and the ranking still answers.
+        // A frame with no pixels has its centre at the origin rather than a NaN
+        // or a panic. `right` is the farther of the two from the reference
+        // centre and the nearer to (0, 0), and it is listed *first* here: a
+        // centre that came out NaN would leave it leading and the answer would
+        // be 0.
         let mut degenerate = PrimarySelector::from_frame_size(0, 0);
         assert_eq!(
-            degenerate.select(&[left, right]),
-            Some(0),
-            "the box nearer the origin wins"
+            degenerate.select(&[right, left]),
+            Some(1),
+            "the box nearer the origin is at index 1"
         );
     }
 }
