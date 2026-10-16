@@ -2462,6 +2462,96 @@ mod tests {
     }
 
     #[test]
+    fn decode_matches_the_eval_harness() {
+        // The phone evaluation in `research/yolox/` re-implements `decode_row`
+        // in Python. If that re-implementation differed from this one, the
+        // measured precision and recall would describe the Python rather than
+        // the shipped code — the same trap as R39, one layer up.
+        //
+        // This drives the *real* `decode_row` over a fixture and prints the
+        // detections, so the printed answer can be lined up against what the
+        // Python harness produces for the same rows. The tensor is synthetic
+        // because this crate's tests do no I/O and the ONNX file is not
+        // available to them; what is being checked is the decode arithmetic —
+        // grid offsets, `exp` scaling, score, class filter and NMS — not the
+        // model.
+        let frame = letterboxed_frame((10, 20, 30));
+
+        // Two overlapping phone rows and a person row, so the class filter, the
+        // score and NMS all contribute to the printed answer, plus one phone row
+        // below threshold.
+        let mut raw = blank_predictions();
+        set_row(
+            &mut raw,
+            0,
+            &row_for(0.9, CELL_PHONE_CLASS as usize, 0.95, [0.0, 0.0, 1.0, 1.0]),
+        );
+        set_row(
+            &mut raw,
+            1,
+            &row_for(0.9, CELL_PHONE_CLASS as usize, 0.90, [0.0, 0.0, 1.0, 1.0]),
+        );
+        set_row(
+            &mut raw,
+            2,
+            &row_for(0.9, PERSON_CLASS as usize, 0.95, [0.0, 0.0, 1.0, 1.0]),
+        );
+        set_row(
+            &mut raw,
+            3,
+            &row_for(0.2, CELL_PHONE_CLASS as usize, 0.90, [0.0, 0.0, 1.0, 1.0]),
+        );
+
+        let (detector, _) = detector_returning(predictions_output(raw));
+        let detections = detector.detect(&frame).expect("a well-formed output");
+
+        println!("RUST DECODE CHECK");
+        for detection in &detections {
+            println!(
+                "  class={:2} score={:.6} rect=({:.4}, {:.4}, {:.4}, {:.4})",
+                detection.class_id,
+                detection.score,
+                detection.rect.x,
+                detection.rect.y,
+                detection.rect.w,
+                detection.rect.h
+            );
+        }
+
+        // Hand-computed expectations, so the test is not merely a print. All
+        // four rows are at stride 8; the class score is what decides which phone
+        // survives, and the person is a different class so it is never
+        // suppressed against them.
+        assert_eq!(
+            detections.len(),
+            2,
+            "row 3 is below threshold and row 1 is suppressed as a duplicate of \
+             row 0's class: {detections:?}"
+        );
+        let phones: Vec<_> = detections
+            .iter()
+            .filter(|det| det.class_id == CELL_PHONE_CLASS)
+            .collect();
+        assert_eq!(phones.len(), 1, "the weaker phone duplicate is suppressed");
+        assert_eq!(
+            phones[0].score,
+            0.9 * 0.95,
+            "0.855, the strongest phone row"
+        );
+        assert_eq!(
+            phones[0].rect.w,
+            1.0f32.exp() * 8.0 * 4.0,
+            "exp(1) * stride 8, out of the letterbox"
+        );
+        // The person row is a different class at the same place, so class-aware
+        // NMS keeps both — and the fixture's IoU between them is 1.0.
+        assert!(
+            detections.iter().any(|det| det.class_id == PERSON_CLASS),
+            "the person survives despite sitting on the phone: {detections:?}"
+        );
+    }
+
+    #[test]
     fn preprocessing_is_deterministic_and_samples_the_frames_corner() {
         // Pure: same frame in, same tensor out.
         let frame = letterboxed_frame((10, 20, 30));
