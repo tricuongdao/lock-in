@@ -148,15 +148,46 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
     if value.is_finite() { value } else { fallback }
 }
 
-/// Builds the BGR NCHW tensor the graph expects from `eye_box` of `frame`.
+/// Builds the BGR NCHW tensor the graph expects from one eye's box and the
+/// head's roll.
 ///
-/// Pure: same frame and box in, same tensor out, with no clock and no randomness.
+/// Pure: same frame, box and angle in, same tensor out, with no clock and no
+/// randomness.
 ///
-/// The box is resized to 32x32 **ignoring its aspect ratio**, because the graph's
-/// input is fixed at a square. The spec has stage 2 hand over a square box
-/// (1.8x the inter-landmark eye distance, roll-corrected before cropping), so for
-/// the real caller this is a uniform scale; a non-square box is squeezed rather
-/// than letterboxed, which is what the upstream demo's `cv2.resize` does.
+/// The box is resized to 32x32 **ignoring its aspect ratio**, because the
+/// graph's input is fixed at a square. [`eye_boxes`](crate::analyze::eyes::eye_boxes) hands over a square
+/// per eye (`1.8x` that eye's own corner distance), so for the real caller this
+/// is a uniform scale; a non-square box is squeezed rather than letterboxed,
+/// which is what the upstream demo's `cv2.resize` does.
+///
+/// # `roll_degrees` is the correction, not a detail
+///
+/// The reference crops the eye region *upright*: it takes the head's roll and
+/// rotates the crop back before inference, which is the only way a rolled head
+/// can put an upright eye into a graph trained on upright eyes. This function is
+/// where that happens, because the box it is handed is an axis-aligned
+/// [`Rect`] -- a rectangle cannot carry a rotation, so the angle is a separate
+/// argument and the *sampling* is what rotates.
+///
+/// The convention, stated because the sign is not self-evident: `roll_degrees`
+/// is positive when the head is rolled **clockwise on screen**, the same sign
+/// [`Euler::roll`](crate::analyze::pose::Euler::roll) reports. The sample for a
+/// tensor coordinate `(u, v)`, measured in pixels from the box's centre with `u`
+/// to the right and `v` down, is taken at the frame offset
+///
+/// ```text
+/// (x, y) = (u * cos r + v * sin r, -u * sin r + v * cos r)
+/// ```
+///
+/// about that centre -- the image of `(u, v)` rotated by the roll, so the crop
+/// the graph sees is the eye turned back to level. At `r = 0` this reduces to
+/// `(u, v)` and the sampling is the plain resize it has always been.
+///
+/// A non-finite angle is treated as zero rather than propagated: a NaN in `sin`
+/// or `cos` would make every sample coordinate a NaN, and `sample_bgr` would
+/// clamp that to the frame's corner -- a crop of one pixel repeated 1024 times,
+/// which the graph would classify as confidently as any other. Zero produces a
+/// usable crop of the right region instead of a silently degenerate one.
 ///
 /// Sampling follows `cv2.resize`'s pixel-centre convention, the same one
 /// [`facemesh::preprocess`](crate::models::facemesh::preprocess) uses: output
@@ -170,7 +201,7 @@ fn finite_or(value: f32, fallback: f32) -> f32 {
 /// [`classify_from_probs`] compares two floats and every comparison against a
 /// NaN is false — so the NaN reads as a confident *open* eye, for every frame,
 /// forever.
-pub fn preprocess(frame: &Frame, eye_box: &Rect) -> InputTensor {
+pub fn preprocess(frame: &Frame, eye_box: &Rect, roll_degrees: f32) -> InputTensor {
     let plane = INPUT_SIZE * INPUT_SIZE;
     let mut data = vec![0.0f32; plane * CHANNELS];
 
@@ -183,17 +214,46 @@ pub fn preprocess(frame: &Frame, eye_box: &Rect) -> InputTensor {
     let step_x = width / INPUT_SIZE as f32;
     let step_y = height / INPUT_SIZE as f32;
 
+    let angle = if roll_degrees.is_finite() {
+        roll_degrees.to_radians()
+    } else {
+        0.0
+    };
+    let (sin, cos) = angle.sin_cos();
+
+    // The rotation is about the box's centre, which is what keeps the crop on
+    // the eye when the head is rolled: a box's top-left corner is not a
+    // rotation-invariant reference. Tensor coordinates are therefore measured
+    // from that centre -- `column + 0.5 - half` is the tensor's own x offset in
+    // tensor units, zero at the middle -- and scaled by the step. The trailing
+    // `- 0.5` is `cv2.resize`'s pixel-*centre* convention, which belongs to the
+    // frame's coordinates rather than to the offset, and it is applied after the
+    // rotation for exactly that reason: at a roll of zero the arithmetic is then
+    // the same expression the axis-aligned resize always computed, which is what
+    // the golden-value tests assert.
+    let centre_x = x1 + width * 0.5;
+    let centre_y = y1 + height * 0.5;
+    // The half-size those offsets are measured from, in tensor units. Derived
+    // from `INPUT_SIZE` rather than written as `16.0`, so the two cannot drift
+    // apart if the graph's input size ever changes. The `as f32` is load-bearing
+    // in a way that is easy to miss: `INPUT_SIZE / 2` alone would be an integer
+    // division, and a bare `16.0` would make the whole expression infer as `f64`
+    // -- which is not a style point, it is a half-pixel shift in every sample.
+    let half = INPUT_SIZE as f32 * 0.5;
+
     for row in 0..INPUT_SIZE {
-        let source_y = y1 + (row as f32 + 0.5) * step_y - 0.5;
+        let offset_y = (row as f32 + 0.5 - half) * step_y;
         for column in 0..INPUT_SIZE {
-            let source_x = x1 + (column as f32 + 0.5) * step_x - 0.5;
-            // `source_x`/`source_y`, not the loop counters: those are *tensor*
-            // coordinates, and using them crops the frame's top-left corner
-            // instead of the eye box. The tensor still has the shape the graph
-            // wants and its values are still in range, so nothing downstream can
-            // tell — every verdict would simply be about the wrong pixels, and
-            // `Drowsy` would be decided by whatever is at the top-left of the
-            // frame.
+            let offset_x = (column as f32 + 0.5 - half) * step_x;
+            // The offset from the box's centre, rotated by the roll. `source_x`/
+            // `source_y`, not the loop counters: those are *tensor* coordinates,
+            // and using them crops the frame's top-left corner instead of the
+            // eye box. The tensor still has the shape the graph wants and its
+            // values are still in range, so nothing downstream can tell — every
+            // verdict would simply be about the wrong pixels, and `Drowsy` would
+            // be decided by whatever is at the top-left of the frame.
+            let source_x = centre_x + offset_x * cos + offset_y * sin - 0.5;
+            let source_y = centre_y - offset_x * sin + offset_y * cos - 0.5;
             let (b, g, r) = sample_bgr(frame, source_x, source_y);
             let index = row * INPUT_SIZE + column;
             // BGR passed through in the order the frame already holds it. This
@@ -335,14 +395,25 @@ impl EyeStateClassifier {
     /// `true`. A caller that treats the two returns symmetrically has the bug
     /// R14 is about.
     ///
-    /// `eye_box` is the roll-corrected eye box stage 2 produced, in `frame`'s
-    /// coordinates; the crop is taken here and nothing is written back, because
-    /// this stage contributes a verdict and no geometry.
+    /// `eye_box` is one eye's box from [`eye_boxes`](crate::analyze::eyes::eye_boxes), in `frame`'s
+    /// coordinates, and `roll_degrees` is the head's roll that goes with it —
+    /// [`Euler::roll`](crate::analyze::pose::Euler::roll), whose sign and
+    /// sampling convention [`preprocess`] states. Both are needed together: the
+    /// box is axis-aligned and the angle is what turns the crop upright, so a
+    /// caller that passes `0.0` on a rolled head hands the graph a rotated eye.
+    ///
+    /// The crop is taken here and nothing is written back, because this stage
+    /// contributes a verdict and no geometry.
     ///
     /// Costs one 32x32 BGR tensor per call — 3072 floats, which at 5 Hz is
     /// nothing next to the two graphs either side of it.
-    pub fn classify(&self, frame: &Frame, eye_box: &Rect) -> Result<bool, ModelError> {
-        let input = preprocess(frame, eye_box);
+    pub fn classify(
+        &self,
+        frame: &Frame,
+        eye_box: &Rect,
+        roll_degrees: f32,
+    ) -> Result<bool, ModelError> {
+        let input = preprocess(frame, eye_box, roll_degrees);
         let outputs = self.session.run(&[input])?;
         let probs = read_probs(&outputs)?;
         Ok(classify_from_probs(probs))
@@ -352,6 +423,7 @@ impl EyeStateClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::analyze::eyes;
     use crate::models::{FakeSession, FakeSessionHandle};
     use std::time::Instant;
 
@@ -477,7 +549,7 @@ mod tests {
         let (closed, _) = classifier_returning(probs_output(0.99, 0.01));
         assert!(
             closed
-                .classify(&frame, &eye_box)
+                .classify(&frame, &eye_box, 0.0)
                 .expect("a well-formed output"),
             "p[0] high must reach the caller as CLOSED"
         );
@@ -485,7 +557,7 @@ mod tests {
         let (open, _) = classifier_returning(probs_output(0.01, 0.99));
         assert!(
             !open
-                .classify(&frame, &eye_box)
+                .classify(&frame, &eye_box, 0.0)
                 .expect("a well-formed output"),
             "p[1] high must reach the caller as OPEN"
         );
@@ -501,7 +573,7 @@ mod tests {
         // The frame is solid, so resampling returns it unchanged whatever the
         // geometry is and the assertions below are about the regime alone.
         let frame = solid_frame(64, 64, (0, 128, 255));
-        let tensor = preprocess(&frame, &rect(0.0, 0.0, 64.0, 64.0));
+        let tensor = preprocess(&frame, &rect(0.0, 0.0, 64.0, 64.0), 0.0);
 
         let plane = INPUT_SIZE * INPUT_SIZE;
         let blue = expected(0.0);
@@ -545,6 +617,215 @@ mod tests {
     }
 
     #[test]
+    fn preprocessing_rotates_the_crop_by_the_head_roll() {
+        // A frame whose blue is the *column* and green the *row*, so every sample
+        // says which frame pixel it came from.
+        let frame = frame_with(64, 64, |x, y| (x as u8, y as u8, 0));
+
+        // A 32x32 box at (24, 8), sampled at a roll of 90 degrees. The box is
+        // square, so `step` is exactly 1.0 and the tensor's own coordinates are
+        // its offset from the box's centre in pixels.
+        let eye_box = rect(24.0, 8.0, 32.0, 32.0);
+        let tensor = preprocess(&frame, &eye_box, 90.0);
+        assert_eq!(tensor.shape, vec![1, 3, 32, 32], "still the graph's input");
+
+        // The rotation is about the box's centre. `(u, v)` is the tensor pixel's
+        // offset from that centre in pixels -- `column + 0.5 - 16` and
+        // `row + 0.5 - 16`, the pixel-centre convention already applied -- and at
+        // 90 degrees the sampling is
+        // `(u cos + v sin, -u sin + v cos) = (v, -u)`, so the source is
+        // `(24 + 16 + v, 8 + 16 - u) - 0.5`, the trailing half pixel being the
+        // frame-space part of that same convention.
+        //
+        // So a head rolled 90 degrees clockwise -- its eye line pointing *down*
+        // the image -- comes back upright when the tensor's rows walk the frame's
+        // **x** and its columns walk the frame's **y**, which is what the mapping
+        // above does. That axis swap is the whole content of the rotation and the
+        // thing an implementation ignoring the angle cannot do.
+        //
+        // It is asserted through the *gradients* rather than at individual
+        // samples, because at exactly 90 degrees the cosine is `-4.4e-8` in `f32`
+        // rather than zero: a sample sitting on a pixel boundary reads its
+        // neighbour, so a point-by-point equality would be testing the float's last
+        // bit rather than the rotation. The gradients are what the rotation is: one
+        // tensor step along a row advances the source x by `sin r` and the source y
+        // by `cos r`, and along a column by `cos r` and `-sin r`. At 90 degrees
+        // that is `(1, 0)` and `(0, -1)` -- the axes swapped, which is precisely
+        // the claim.
+        //
+        // The point-by-point arithmetic is pinned by the half turn below, where
+        // those constants are exact.
+        for row in 1..INPUT_SIZE {
+            for column in 1..INPUT_SIZE {
+                assert!(
+                    (at(&tensor, 0, column, row) - at(&tensor, 0, column - 1, row)).abs() < 1e-2,
+                    "one step along a tensor row leaves the source y alone, so blue \
+                     (the source x) must not move: (column {column}, row {row})"
+                );
+                assert!(
+                    (at(&tensor, 1, column, row) - at(&tensor, 1, column, row - 1)).abs() < 1e-2,
+                    "and one step down a tensor column leaves the source x alone, so \
+                     green (the source y) must not move: (column {column}, row {row})"
+                );
+                // And across each axis the other channel advances by exactly one
+                // frame pixel: `step` is 1.0 and the sine is 1.0, so the change per
+                // step is one byte of the frame, `1/255`.
+                assert!(
+                    (at(&tensor, 1, column, row) - at(&tensor, 1, column - 1, row)).abs()
+                        > 0.9 / 255.0,
+                    "green advances by a frame pixel along a tensor row"
+                );
+                assert!(
+                    (at(&tensor, 0, column, row) - at(&tensor, 0, column, row - 1)).abs()
+                        > 0.9 / 255.0,
+                    "and blue advances by one down a tensor column"
+                );
+            }
+        }
+
+        // A roll of zero is not a rotation, and is asserted here to be exactly the
+        // plain resize rather than merely close to it: `classify` is called with
+        // the head's roll every tick, and the overwhelming majority of those
+        // calls are near zero. A rotation that perturbed them by a pixel would
+        // change every verdict in the corpus while looking correct on the
+        // quarter-turn cases. The exact pixel-by-pixel layout at zero roll is
+        // pinned by the four tests above this one; this is the check that the
+        // rotation path does not disturb it.
+        assert_eq!(
+            preprocess(&frame, &eye_box, 0.0).data,
+            preprocess(&frame, &eye_box, 360.0).data,
+            "a full turn is no turn"
+        );
+
+        // And the sign is pinned, not just the magnitude. At +90 the tensor's
+        // first pixel reads the frame's bottom-left corner of the box and at -90
+        // its top-left; `(v, -u)` and `(-v, u)` are the two ways to put the same
+        // eye upright, they differ only in which way round it arrives, and a graph
+        // trained on upright eyes cannot tell which one it was handed. Only one of
+        // them is the reference's, so only one can be right.
+        let clockwise = preprocess(&frame, &eye_box, 90.0);
+        let anticlockwise = preprocess(&frame, &eye_box, -90.0);
+        // And the sign of the rotation is used, not just its magnitude: the two
+        // quarter turns traverse the eye line in opposite directions and are
+        // therefore different crops, and they differ in a way no reader of the
+        // tensor can recover after the fact -- a graph handed the mirrored eye sees
+        // a plausible upright eye either way. Only one of the two is what the
+        // reference does, so a sampler that ignored the sign would be wrong for
+        // every rolled head and right at zero.
+        //
+        // Their identity at zero is the assertion above; this is its dual. The
+        // gradients are asserted for `clockwise` alone because which of the two is
+        // the reference's direction is stated in `preprocess`'s convention and
+        // exercised through it, not re-derived here.
+        assert_ne!(
+            clockwise.data, anticlockwise.data,
+            "the sign of the roll decides which eye orientation reaches the graph"
+        );
+
+        // An unusable angle is no rotation, not a NaN smear: a NaN in `sin` or
+        // `cos` would make every sample coordinate a NaN, and the sampler clamps
+        // that to the frame's last pixel -- a crop of one repeated pixel, which
+        // the graph classifies as confidently as any other.
+        assert_eq!(
+            preprocess(&frame, &eye_box, f32::NAN).data,
+            preprocess(&frame, &eye_box, 0.0).data,
+            "a NaN roll falls back to the unrotated crop"
+        );
+        assert_eq!(
+            preprocess(&frame, &eye_box, f32::INFINITY).data,
+            preprocess(&frame, &eye_box, 0.0).data,
+            "and so does an infinite one"
+        );
+    }
+
+    #[test]
+    fn the_boxes_stage_two_hands_over_classify_without_complaint() {
+        // The seam this task exists to keep working: whatever `analyze::eyes`
+        // produces must be a box this classifier can crop, and the roll it
+        // produces alongside must be one this classifier can use. The two modules
+        // are tested apart, so this is the only place the real shapes meet.
+        //
+        // A synthetic frontal face at the coordinates both modules' fixtures use:
+        // the left eye's corners at (40, 100) and (80, 100), the right eye's at
+        // (240, 100) and (280, 100), each eye 40 px wide.
+        let mut landmarks = [[0i32; 3]; 468];
+        for (index, x, y) in [
+            (33, 40, 100),
+            (160, 54, 88),
+            (158, 66, 88),
+            (133, 80, 100),
+            (153, 66, 112),
+            (144, 54, 112),
+            (263, 240, 100),
+            (385, 254, 88),
+            (380, 266, 88),
+            (362, 280, 100),
+            (373, 266, 112),
+            (387, 254, 112),
+        ] {
+            landmarks[index] = [x, y, 0];
+        }
+
+        let frame = frame_with(640, 480, |x, y| (x as u8, y as u8, (x + y) as u8));
+        let (classifier, handle) = classifier_returning(probs_output(0.99, 0.01));
+
+        let boxes = eyes::eye_boxes(&landmarks);
+        assert_eq!(
+            boxes.map(|box_| box_.is_some()),
+            [true, true],
+            "both eyes are present in this fixture"
+        );
+
+        // The head is rolled 12 degrees, which is what stage 2 passes from
+        // `Euler.roll`, and both crops must reach the graph as its input.
+        for box_ in boxes.into_iter().flatten() {
+            let verdict = classifier
+                .classify(&frame, &box_, 12.0)
+                .expect("a well-formed output");
+            assert!(verdict, "p[0] high is a closed eye, per R14");
+        }
+
+        let calls = handle.inputs();
+        assert_eq!(calls.len(), 2, "one crop per eye");
+        for (call, expected) in calls.iter().zip(boxes.into_iter().flatten()) {
+            assert_eq!(call[0].shape, vec![1, 3, 32, 32], "the graph's input");
+            assert_eq!(
+                call[0].data,
+                preprocess(&frame, &expected, 12.0).data,
+                "and each crop is that eye's box, sampled at the roll it came with"
+            );
+        }
+    }
+
+    #[test]
+    fn classify_hands_the_roll_to_preprocess() {
+        // The rotation is only worth having if it survives the trip through
+        // `classify`, which is the function stage 2b actually calls. The tensor
+        // the session receives is the assertion: a `classify` that dropped the
+        // angle -- or passed a constant -- would send the unrotated crop and
+        // every verdict would be about a rolled eye.
+        let frame = frame_with(64, 64, |x, y| (x as u8, y as u8, 0));
+        let eye_box = rect(24.0, 8.0, 32.0, 32.0);
+        let (classifier, handle) = classifier_returning(probs_output(1.0, 0.0));
+        classifier
+            .classify(&frame, &eye_box, 90.0)
+            .expect("a well-formed output");
+
+        let calls = handle.inputs();
+        assert_eq!(calls.len(), 1, "one crop is one run");
+        assert_eq!(
+            calls[0][0].data,
+            preprocess(&frame, &eye_box, 90.0).data,
+            "the session was handed the rolled crop, not the plain one"
+        );
+        assert_ne!(
+            calls[0][0].data,
+            preprocess(&frame, &eye_box, 0.0).data,
+            "which is a different tensor from the unrolled crop"
+        );
+    }
+
+    #[test]
     fn preprocessing_squeezes_a_non_square_box_to_32x32() {
         // The spec's eye box is square — 1.8x the inter-landmark eye distance,
         // roll-corrected — so *every* box the real caller produces has
@@ -562,7 +843,7 @@ mod tests {
         // tensor columns land on frame columns 8..=39, while the vertical step is
         // 0.5, stretching the box's 16 rows across all 32 output rows.
         let eye_box = rect(8.0, 16.0, 32.0, 16.0);
-        let tensor = preprocess(&frame, &eye_box);
+        let tensor = preprocess(&frame, &eye_box, 0.0);
 
         assert_eq!(tensor.shape, vec![1, 3, 32, 32], "the box is squeezed flat");
 
@@ -621,7 +902,11 @@ mod tests {
             let value = (x * 255 / (INPUT_SIZE as u32 - 1)) as u8;
             (value, value, value)
         });
-        let tensor = preprocess(&ramp, &rect(0.0, 0.0, INPUT_SIZE as f32, INPUT_SIZE as f32));
+        let tensor = preprocess(
+            &ramp,
+            &rect(0.0, 0.0, INPUT_SIZE as f32, INPUT_SIZE as f32),
+            0.0,
+        );
         let data = values(&tensor);
         assert_eq!(data.len(), CHANNELS * INPUT_SIZE * INPUT_SIZE);
 
@@ -663,7 +948,7 @@ mod tests {
         let eye_box = rect(16.0, 8.0, 32.0, 32.0);
         let (classifier, handle) = classifier_returning(probs_output(1.0, 0.0));
         classifier
-            .classify(&frame, &eye_box)
+            .classify(&frame, &eye_box, 0.0)
             .expect("a well-formed output");
 
         // What the session was handed, which is what the graph actually sees.
@@ -686,7 +971,7 @@ mod tests {
         // The corners and a middle pixel, so the box's origin and its extent are
         // both pinned. A crop of the frame's top-left corner instead — the same
         // *shape*, and the bug that looks right — reads blue 0 and 31 here.
-        let tensor = preprocess(&frame, &eye_box);
+        let tensor = preprocess(&frame, &eye_box, 0.0);
 
         // And it is the tensor for *this* box that reached the graph. Every
         // assertion above is about shape and type, and a `classify` that
@@ -728,7 +1013,7 @@ mod tests {
         // An implementation that ignored `eye_box` entirely would pass every
         // shape assertion above and fail this one.
         assert_ne!(
-            preprocess(&frame, &rect(0.0, 0.0, 32.0, 32.0)).data,
+            preprocess(&frame, &rect(0.0, 0.0, 32.0, 32.0), 0.0).data,
             tensor.data,
             "the eye box decides which pixels are cropped"
         );
@@ -740,8 +1025,8 @@ mod tests {
         let eye_box = rect(16.0, 8.0, 32.0, 32.0);
 
         assert_eq!(
-            preprocess(&frame, &eye_box),
-            preprocess(&frame, &eye_box),
+            preprocess(&frame, &eye_box, 0.0),
+            preprocess(&frame, &eye_box, 0.0),
             "pure: the same frame and box give the same tensor"
         );
 
@@ -763,7 +1048,7 @@ mod tests {
             ("a negative area", rect(32.0, 32.0, -8.0, -8.0)),
             ("a box off the frame", rect(600.0, 600.0, 32.0, 32.0)),
         ] {
-            let tensor = preprocess(&frame, &box_);
+            let tensor = preprocess(&frame, &box_, 0.0);
             let data = values(&tensor);
             assert_eq!(data.len(), CHANNELS * INPUT_SIZE * INPUT_SIZE, "{label}");
             assert!(
@@ -776,20 +1061,20 @@ mod tests {
         // above total rather than merely non-panicking. Asserted against the
         // sanitised box itself, so the policy is pinned rather than described.
         assert_eq!(
-            preprocess(&frame, &rect(f32::NAN, 0.0, 32.0, 32.0)),
-            preprocess(&frame, &rect(0.0, 0.0, 32.0, 32.0)),
+            preprocess(&frame, &rect(f32::NAN, 0.0, 32.0, 32.0), 0.0),
+            preprocess(&frame, &rect(0.0, 0.0, 32.0, 32.0), 0.0),
             "a NaN edge reads as zero"
         );
         assert_eq!(
-            preprocess(&frame, &rect(0.0, 0.0, f32::INFINITY, 32.0)),
-            preprocess(&frame, &rect(0.0, 0.0, 0.0, 32.0)),
+            preprocess(&frame, &rect(0.0, 0.0, f32::INFINITY, 32.0), 0.0),
+            preprocess(&frame, &rect(0.0, 0.0, 0.0, 32.0), 0.0),
             "so does an infinite width"
         );
 
         // A frame with no pixels has nothing to sample; black, not a panic.
         let empty =
             Frame::new(0, 0, Vec::new(), Instant::now()).expect("an empty frame is a frame");
-        let tensor = preprocess(&empty, &eye_box);
+        let tensor = preprocess(&empty, &eye_box, 0.0);
         assert!(
             values(&tensor).iter().all(|value| *value == expected(0.0)),
             "a frame with no pixels is black"
@@ -806,7 +1091,7 @@ mod tests {
         let eye_box = rect(0.0, 0.0, 32.0, 32.0);
         let classify = |outputs: Vec<OutputTensor>| {
             EyeStateClassifier::new(Box::new(FakeSession::new("eyestate", outputs)))
-                .classify(&frame, &eye_box)
+                .classify(&frame, &eye_box, 0.0)
         };
 
         let error = classify(vec![OutputTensor {
