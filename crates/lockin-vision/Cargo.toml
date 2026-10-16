@@ -9,6 +9,7 @@ image.workspace = true
 nalgebra.workspace = true
 nokhwa.workspace = true
 serde.workspace = true
+smallvec.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]

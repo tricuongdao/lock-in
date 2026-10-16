@@ -684,6 +684,7 @@ dependencies = [
  "nokhwa",
  "serde",
  "serde_json",
+ "smallvec",
  "tempfile",
  "thiserror",
 ]
